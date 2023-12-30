@@ -1,8 +1,5 @@
 use bytes::BytesMut;
-use chacha20poly1305::{
-    aead::{AeadInPlace, NewAead},
-    ChaCha8Poly1305, Key, Nonce, Tag,
-};
+use chacha20poly1305::{aead::AeadInPlace, ChaCha8Poly1305, Key, KeyInit, Nonce, Tag};
 use quinn_proto::crypto::{CryptoError, HeaderKey, KeyPair, PacketKey};
 
 pub fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
@@ -17,8 +14,7 @@ pub struct ChaCha8PacketKey(ChaCha8Poly1305);
 
 impl ChaCha8PacketKey {
     pub fn new(key: [u8; 32]) -> Self {
-        let key = Key::from(key);
-        Self(ChaCha8Poly1305::new(&key))
+        Self(ChaCha8Poly1305::new(&Key::from(key)))
     }
 }
 

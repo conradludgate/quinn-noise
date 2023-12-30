@@ -11,12 +11,12 @@ pub trait DiffieHellman {
     fn diffie_hellman(&self, public: &Self::PublicKey) -> Self::SharedSecret;
 }
 
-impl DiffieHellman for ed25519::Keypair {
-    type PublicKey = ed25519::PublicKey;
+impl DiffieHellman for ed25519::SigningKey {
+    type PublicKey = ed25519::VerifyingKey;
     type SharedSecret = [u8; 32];
 
     fn diffie_hellman(&self, public: &Self::PublicKey) -> Self::SharedSecret {
-        let sk = ed25519_to_x25519_sk(&self.secret);
+        let sk = ed25519_to_x25519_sk(self.as_bytes());
         let pk = ed25519_to_x25519_pk(public);
         *sk.diffie_hellman(&pk).as_bytes()
     }
@@ -39,14 +39,14 @@ fn ed25519_to_x25519_sk(ed25519_sk: &ed25519::SecretKey) -> x25519::StaticSecret
     // the same to yield a Curve25519 keypair with the same public key.
     let mut curve25519_sk: [u8; 32] = [0; 32];
     let hash = Sha512::digest(ed25519_sk.as_ref());
-    curve25519_sk.copy_from_slice(&hash.as_ref()[..32]);
+    curve25519_sk.copy_from_slice(&hash[..32]);
     let sk = x25519::StaticSecret::from(curve25519_sk); // Copy
     curve25519_sk.zeroize();
     sk
 }
 
 /// Construct a curve25519 public key from an Ed25519 public key.
-fn ed25519_to_x25519_pk(pk: &ed25519::PublicKey) -> x25519::PublicKey {
+fn ed25519_to_x25519_pk(pk: &ed25519::VerifyingKey) -> x25519::PublicKey {
     x25519::PublicKey::from(
         CompressedEdwardsY(pk.to_bytes())
             .decompress()
@@ -62,10 +62,10 @@ mod tests {
 
     #[test]
     fn ed25519_dh() {
-        let sk1 = ed25519::Keypair::generate(&mut rand_core::OsRng {});
-        let sk2 = ed25519::Keypair::generate(&mut rand_core::OsRng {});
-        let s1 = sk1.diffie_hellman(&sk2.public);
-        let s2 = sk2.diffie_hellman(&sk1.public);
+        let sk1 = ed25519::SigningKey::generate(&mut rand_core::OsRng {});
+        let sk2 = ed25519::SigningKey::generate(&mut rand_core::OsRng {});
+        let s1 = sk1.diffie_hellman(&sk2.verifying_key());
+        let s2 = sk2.diffie_hellman(&sk1.verifying_key());
         assert_eq!(s1, s2);
     }
 }

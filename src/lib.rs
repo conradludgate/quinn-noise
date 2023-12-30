@@ -6,7 +6,7 @@ mod session;
 pub use crate::aead::ChaCha8PacketKey;
 pub use crate::keylog::{KeyLog, KeyLogFile};
 pub use crate::session::{NoiseClientConfig, NoiseConfig, NoiseServerConfig, NoiseSession};
-pub use ed25519_dalek::{Keypair, PublicKey, SecretKey};
+pub use ed25519_dalek::{SigningKey, VerifyingKey, SecretKey};
 
 // https://github.com/quicwg/base-drafts/wiki/QUIC-Versions
 // reserved versions for quinn-noise 0xf0f0f2f[0-f]

@@ -1,7 +1,7 @@
 use crate::aead::{header_keypair, ChaCha8PacketKey, PlaintextHeaderKey};
 use crate::dh::DiffieHellman;
 use crate::keylog::KeyLog;
-use ed25519_dalek::{Keypair, PublicKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn_proto::crypto::{
     ClientConfig, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, ServerConfig,
     Session,
@@ -10,6 +10,7 @@ use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
 use ring::aead;
 use std::any::Any;
+use std::convert::TryFrom;
 use std::io::Cursor;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -17,13 +18,13 @@ use xoodoo::Xoodyak;
 
 pub struct NoiseClientConfig {
     /// Keypair to use.
-    pub keypair: Keypair,
+    pub keypair: SigningKey,
     /// Optional private shared key usable as a password for private networks.
     pub psk: Option<[u8; 32]>,
     /// Enables keylogging for debugging purposes to the path provided by `SSLKEYLOGFILE`.
     pub keylogger: Option<Arc<dyn KeyLog>>,
     /// The remote public key. This needs to be set.
-    pub remote_public_key: PublicKey,
+    pub remote_public_key: VerifyingKey,
     /// ALPN string to use.
     pub alpn: Vec<u8>,
 }
@@ -43,7 +44,7 @@ impl From<NoiseClientConfig> for NoiseConfig {
 
 pub struct NoiseServerConfig {
     /// Keypair to use.
-    pub keypair: Keypair,
+    pub keypair: SigningKey,
     /// Optional private shared key usable as a password for private networks.
     pub psk: Option<[u8; 32]>,
     /// Enables keylogging for debugging purposes to the path provided by `SSLKEYLOGFILE`.
@@ -69,13 +70,13 @@ impl From<NoiseServerConfig> for NoiseConfig {
 #[derive(Default)]
 pub struct NoiseConfig {
     /// Keypair to use.
-    keypair: Option<Keypair>,
+    keypair: Option<SigningKey>,
     /// Optional private shared key usable as a password for private networks.
     psk: Option<[u8; 32]>,
     /// Enables keylogging for debugging purposes to the path provided by `SSLKEYLOGFILE`.
     keylogger: Option<Arc<dyn KeyLog>>,
     /// The remote public key. This needs to be set.
-    remote_public_key: Option<PublicKey>,
+    remote_public_key: Option<VerifyingKey>,
     /// ALPN string to use.
     alpn: Option<Vec<u8>>,
     /// Supported ALPN identifiers.
@@ -145,11 +146,11 @@ impl NoiseConfig {
     fn start_session(&self, side: Side, params: &TransportParameters) -> NoiseSession {
         let mut rng = rand_core::OsRng {};
         let s = if let Some(keypair) = self.keypair.as_ref() {
-            Keypair::from_bytes(&keypair.to_bytes()).unwrap()
+            SigningKey::from_bytes(keypair.as_bytes())
         } else {
-            Keypair::generate(&mut rng)
+            SigningKey::generate(&mut rng)
         };
-        let e = Keypair::generate(&mut rng);
+        let e = SigningKey::generate(&mut rng);
         NoiseSession {
             xoodyak: Xoodyak::hash(),
             state: State::Initial,
@@ -174,7 +175,7 @@ impl Clone for NoiseConfig {
         let keypair = self
             .keypair
             .as_ref()
-            .map(|keypair| Keypair::from_bytes(&keypair.to_bytes()).unwrap());
+            .map(|keypair| SigningKey::from_bytes(keypair.as_bytes()));
         Self {
             keypair,
             psk: self.psk,
@@ -190,24 +191,24 @@ pub struct NoiseSession {
     xoodyak: Xoodyak,
     state: State,
     side: Side,
-    e: Keypair,
-    s: Keypair,
+    e: SigningKey,
+    s: SigningKey,
     psk: [u8; 32],
     alpn: Option<Vec<u8>>,
     supported_protocols: Option<Vec<Vec<u8>>>,
     transport_parameters: TransportParameters,
     remote_transport_parameters: Option<TransportParameters>,
-    remote_e: Option<PublicKey>,
-    remote_s: Option<PublicKey>,
+    remote_e: Option<VerifyingKey>,
+    remote_s: Option<VerifyingKey>,
     zero_rtt_key: Option<ChaCha8PacketKey>,
     keylogger: Option<Arc<dyn KeyLog>>,
 }
 
 impl NoiseSession {
-    fn conn_id(&self) -> Option<&[u8; 32]> {
+    fn conn_id(&self) -> Option<[u8; 32]> {
         match self.side {
-            Side::Client => Some(self.e.public.as_bytes()),
-            Side::Server => Some(self.remote_e.as_ref()?.as_bytes()),
+            Side::Client => Some(self.e.verifying_key().to_bytes()),
+            Side::Server => Some(self.remote_e.as_ref()?.to_bytes()),
         }
     }
 }
@@ -239,8 +240,8 @@ impl NoiseSession {
         let mut server = [0; 32];
         self.xoodyak.squeeze_key(&mut server);
         if let Some(keylogger) = self.keylogger.as_ref() {
-            keylogger.log("CLIENT_KEY", self.conn_id().unwrap(), &client[..]);
-            keylogger.log("SERVER_KEY", self.conn_id().unwrap(), &server[..]);
+            keylogger.log("CLIENT_KEY", &self.conn_id().unwrap(), &client[..]);
+            keylogger.log("SERVER_KEY", &self.conn_id().unwrap(), &server[..]);
         }
         let client = ChaCha8PacketKey::new(client);
         let server = ChaCha8PacketKey::new(server);
@@ -300,11 +301,11 @@ impl Session for NoiseSession {
                 }
                 let (e, rest) = rest.split_at(32);
                 self.xoodyak.absorb(e);
-                let e = PublicKey::from_bytes(e)
+                let e = VerifyingKey::try_from(e)
                     .map_err(|_| connection_refused("invalid ephemeral public key"))?;
                 self.remote_e = Some(e);
                 // s
-                self.xoodyak.absorb(self.s.public.as_bytes());
+                self.xoodyak.absorb(self.s.verifying_key().as_bytes());
                 // es
                 let es = self.s.diffie_hellman(&e);
                 self.xoodyak.absorb(&es);
@@ -318,8 +319,8 @@ impl Session for NoiseSession {
                 }
                 let (remote_s, rest) = rest.split_at(32);
                 let mut s = [0; 32];
-                self.xoodyak.decrypt(&remote_s, &mut s);
-                let s = PublicKey::from_bytes(&s)
+                self.xoodyak.decrypt(remote_s, &mut s);
+                let s = VerifyingKey::from_bytes(&s)
                     .map_err(|_| connection_refused("invalid static public key"))?;
                 self.remote_s = Some(s);
                 // ss
@@ -343,9 +344,8 @@ impl Session for NoiseSession {
                     .supported_protocols
                     .as_ref()
                     .expect("invalid config")
-                    .into_iter()
-                    .find(|proto| proto.as_slice() == alpn)
-                    .is_some();
+                    .iter()
+                    .any(|proto| proto.as_slice() == alpn);
                 if !is_supported {
                     return Err(connection_refused("unsupported alpn"));
                 }
@@ -356,11 +356,11 @@ impl Session for NoiseSession {
                 }
                 let (params, auth) = rest.split_at(rest.len() - 16);
                 let mut transport_parameters = vec![0; params.len()];
-                self.xoodyak.decrypt(&params, &mut transport_parameters);
+                self.xoodyak.decrypt(params, &mut transport_parameters);
                 // check tag
                 let mut tag = [0; 16];
                 self.xoodyak.squeeze(&mut tag);
-                if !bool::from(tag.ct_eq(&auth)) {
+                if !bool::from(tag.ct_eq(auth)) {
                     return Err(connection_refused("invalid authentication tag"));
                 }
                 self.remote_transport_parameters = Some(TransportParameters::read(
@@ -377,8 +377,8 @@ impl Session for NoiseSession {
                 }
                 let (remote_e, rest) = handshake.split_at(32);
                 let mut e = [0; 32];
-                self.xoodyak.decrypt(&remote_e, &mut e);
-                let e = PublicKey::from_bytes(&e)
+                self.xoodyak.decrypt(remote_e, &mut e);
+                let e = VerifyingKey::from_bytes(&e)
                     .map_err(|_| connection_refused("invalid ephemeral public key"))?;
                 self.remote_e = Some(e);
                 // ee
@@ -393,11 +393,11 @@ impl Session for NoiseSession {
                 }
                 let (params, auth) = rest.split_at(rest.len() - 16);
                 let mut transport_parameters = vec![0; params.len()];
-                self.xoodyak.decrypt(&params, &mut transport_parameters);
+                self.xoodyak.decrypt(params, &mut transport_parameters);
                 // check tag
                 let mut tag = [0; 16];
                 self.xoodyak.squeeze(&mut tag);
-                if !bool::from(tag.ct_eq(&auth)) {
+                if !bool::from(tag.ct_eq(auth)) {
                     return Err(connection_refused("invalid authentication tag"));
                 }
                 self.remote_transport_parameters = Some(TransportParameters::read(
@@ -425,8 +425,8 @@ impl Session for NoiseSession {
                 handshake.extend_from_slice(&[protocol_id.len() as u8]);
                 handshake.extend_from_slice(protocol_id);
                 // e
-                self.xoodyak.absorb(self.e.public.as_bytes());
-                handshake.extend_from_slice(self.e.public.as_bytes());
+                self.xoodyak.absorb(self.e.verifying_key().as_bytes());
+                handshake.extend_from_slice(self.e.verifying_key().as_bytes());
                 // s
                 let s = self.remote_s.unwrap();
                 self.xoodyak.absorb(s.as_bytes());
@@ -439,7 +439,8 @@ impl Session for NoiseSession {
                 self.xoodyak = Xoodyak::keyed(&key, None, None, None);
                 // s
                 let mut s = [0; 32];
-                self.xoodyak.encrypt(self.s.public.as_bytes(), &mut s);
+                self.xoodyak
+                    .encrypt(self.s.verifying_key().as_bytes(), &mut s);
                 handshake.extend_from_slice(&s);
                 // ss
                 let s = self.remote_s.unwrap();
@@ -481,7 +482,8 @@ impl Session for NoiseSession {
             (State::Handshake, Side::Server) => {
                 // e
                 let mut e = [0; 32];
-                self.xoodyak.encrypt(self.e.public.as_bytes(), &mut e);
+                self.xoodyak
+                    .encrypt(self.e.verifying_key().as_bytes(), &mut e);
                 handshake.extend_from_slice(&e);
                 // ee
                 let ee = self.e.diffie_hellman(&self.remote_e.unwrap());
