@@ -1,6 +1,6 @@
 use bytes::BytesMut;
-use chacha20poly1305::{aead::AeadInPlace, ChaCha8Poly1305, Key, KeyInit, Nonce, Tag};
 use quinn_proto::crypto::{CryptoError, HeaderKey, KeyPair, PacketKey};
+use ring::aead;
 
 pub fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
     KeyPair {
@@ -10,26 +10,35 @@ pub fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
 }
 
 #[derive(Clone)]
-pub struct ChaCha8PacketKey(ChaCha8Poly1305);
+pub struct ChaCha8PacketKey {
+    key: aead::LessSafeKey,
+    iv: [u8; 12],
+}
 
 impl ChaCha8PacketKey {
     pub fn new(key: [u8; 32]) -> Self {
-        Self(ChaCha8Poly1305::new(&Key::from(key)))
+        Self {
+            key: aead::LessSafeKey::new(
+                aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).unwrap(),
+            ),
+            iv: [0; 12],
+        }
     }
 }
 
 impl PacketKey for ChaCha8PacketKey {
     fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
-        let mut nonce = [0; 12];
-        nonce[4..].copy_from_slice(&packet.to_le_bytes());
-        let nonce = Nonce::from(nonce);
-        let (header, payload) = buf.split_at_mut(header_len);
-        let (content, auth) = payload.split_at_mut(payload.len() - self.tag_len());
+        let (header, payload_tag) = buf.split_at_mut(header_len);
+        let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - self.tag_len());
+
+        let aad = aead::Aad::from(header);
+        let nonce = nonce_for(packet, &self.iv);
+
         let tag = self
-            .0
-            .encrypt_in_place_detached(&nonce, header, content)
+            .key
+            .seal_in_place_separate_tag(nonce, aad, payload)
             .unwrap();
-        auth.copy_from_slice(&tag);
+        tag_storage.copy_from_slice(tag.as_ref());
     }
 
     fn decrypt(
@@ -38,16 +47,16 @@ impl PacketKey for ChaCha8PacketKey {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
-        let mut nonce = [0; 12];
-        nonce[4..].copy_from_slice(&packet.to_le_bytes());
-        let nonce = Nonce::from(nonce);
-        let len = payload.len() - self.tag_len();
-        let (content, tag) = payload.split_at_mut(len);
-        let tag = Tag::from_slice(tag);
-        self.0
-            .decrypt_in_place_detached(&nonce, header, content, tag)
+        let payload_len = payload.len();
+        let aad = aead::Aad::from(header);
+        let nonce = nonce_for(packet, &self.iv);
+
+        self.key
+            .open_in_place(nonce, aad, payload)
             .map_err(|_| CryptoError)?;
-        payload.truncate(len);
+
+        let plain_len = payload_len - self.key.algorithm().tag_len();
+        payload.truncate(plain_len);
         Ok(())
     }
 
@@ -74,4 +83,14 @@ impl HeaderKey for PlaintextHeaderKey {
     fn sample_size(&self) -> usize {
         0
     }
+}
+
+/// Compute the nonce to use for encrypting or decrypting `packet_number`
+fn nonce_for(packet_number: u64, iv: &[u8; 12]) -> ring::aead::Nonce {
+    let mut out = [0; aead::NONCE_LEN];
+    out[4..].copy_from_slice(&packet_number.to_be_bytes());
+    for (out, inp) in out.iter_mut().zip(iv.iter()) {
+        *out ^= inp;
+    }
+    aead::Nonce::assume_unique_for_key(out)
 }
