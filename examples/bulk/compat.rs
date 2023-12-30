@@ -10,27 +10,17 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
-use quinn::crypto::HandshakeTokenKey;
 use rand::rngs::OsRng;
 use tokio::runtime::{Builder, Runtime};
 use tracing::trace;
 
 pub fn configure_tracing_subscriber() {
-    let filter = tracing_subscriber::EnvFilter::from_default_env();
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
-            .with_env_filter(filter)
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .finish(),
     )
     .unwrap();
-}
-
-struct DummyHandshakeTokenYey;
-
-impl HandshakeTokenKey for DummyHandshakeTokenYey {
-    fn aead_from_hkdf(&self, _random_bytes: &[u8]) -> Box<dyn quinn::crypto::AeadKey> {
-        todo!()
-    }
 }
 
 /// Creates a server endpoint which runs on the given runtime
@@ -47,7 +37,7 @@ pub fn server_endpoint(
             supported_protocols: vec![b"bench".to_vec()],
         },
     ));
-    let mut server_config = quinn::ServerConfig::new(crypto, Arc::new(DummyHandshakeTokenYey));
+    let mut server_config = quinn::ServerConfig::with_crypto(crypto);
     server_config.transport = Arc::new(transport_config(opt));
 
     let endpoint = {

@@ -1,3 +1,5 @@
+use std::convert::TryInto;
+
 use bytes::BytesMut;
 use quinn_proto::crypto::{CryptoError, HeaderKey, KeyPair, PacketKey};
 use ring::aead;
@@ -16,12 +18,14 @@ pub struct ChaCha8PacketKey {
 }
 
 impl ChaCha8PacketKey {
-    pub fn new(key: [u8; 32]) -> Self {
+    pub fn new(key: [u8; 44]) -> Self {
+        let (key, iv) = key.split_at(32);
+        let iv = iv.try_into().unwrap();
         Self {
             key: aead::LessSafeKey::new(
-                aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).unwrap(),
+                aead::UnboundKey::new(&aead::CHACHA20_POLY1305, key).unwrap(),
             ),
-            iv: [0; 12],
+            iv,
         }
     }
 }

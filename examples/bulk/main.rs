@@ -31,7 +31,7 @@ fn main() {
 
     let server_thread = std::thread::spawn(move || {
         if let Err(e) = runtime.block_on(server(endpoint, opt)) {
-            eprintln!("server failed: {:#}", e);
+            eprintln!("server failed: {e:#}");
         }
     });
 
@@ -42,7 +42,7 @@ fn main() {
             match runtime.block_on(client(server_addr, public_key, opt)) {
                 Ok(stats) => Ok(stats),
                 Err(e) => {
-                    eprintln!("client failed: {:#}", e);
+                    eprintln!("client failed: {e:#}");
                     Err(e)
                 }
             }
@@ -73,7 +73,7 @@ async fn server(endpoint: quinn::Endpoint, opt: Opt) -> Result<()> {
                 let (mut send_stream, mut recv_stream) = match connection.accept_bi().await {
                     Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => {
-                        eprintln!("accepting stream failed: {:?}", e);
+                        eprintln!("accepting stream failed: {e:?}");
                         break;
                     }
                     Ok(stream) => stream,
@@ -83,7 +83,7 @@ async fn server(endpoint: quinn::Endpoint, opt: Opt) -> Result<()> {
                 tokio::spawn(async move {
                     drain_stream(&mut recv_stream, opt.read_unordered).await?;
                     send_data_on_stream(&mut send_stream, opt.download_size).await?;
-                    anyhow::Ok(())
+                    Ok::<_, anyhow::Error>(())
                 });
             }
 
@@ -97,7 +97,7 @@ async fn server(endpoint: quinn::Endpoint, opt: Opt) -> Result<()> {
     // and all server tasks to be cancelled
     for handle in server_tasks {
         if let Err(e) = handle.await {
-            eprintln!("Server task error: {:?}", e);
+            eprintln!("Server task error: {e:?}");
         };
     }
 
@@ -201,7 +201,7 @@ struct ClientStats {
 impl ClientStats {
     pub fn print(&self, client_id: usize) {
         println!();
-        println!("Client {} stats:", client_id);
+        println!("Client {client_id} stats:");
 
         if self.upload_stats.total_size != 0 {
             self.upload_stats.print("upload");

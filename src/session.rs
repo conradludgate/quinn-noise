@@ -116,8 +116,8 @@ impl ServerConfig for NoiseConfig {
         Ok(Keys {
             header: header_keypair(),
             packet: KeyPair {
-                local: Box::new(ChaCha8PacketKey::new([0; 32])),
-                remote: Box::new(ChaCha8PacketKey::new([0; 32])),
+                local: Box::new(ChaCha8PacketKey::new([0; 44])),
+                remote: Box::new(ChaCha8PacketKey::new([0; 44])),
             },
         })
     }
@@ -235,9 +235,9 @@ impl NoiseSession {
         if !self.is_handshaking() {
             self.xoodyak.ratchet();
         }
-        let mut client = [0; 32];
+        let mut client = [0; 44];
         self.xoodyak.squeeze_key(&mut client);
-        let mut server = [0; 32];
+        let mut server = [0; 44];
         self.xoodyak.squeeze_key(&mut server);
         if let Some(keylogger) = self.keylogger.as_ref() {
             keylogger.log("CLIENT_KEY", &self.conn_id().unwrap(), &client[..]);
@@ -263,8 +263,8 @@ impl Session for NoiseSession {
         Keys {
             header: header_keypair(),
             packet: KeyPair {
-                local: Box::new(ChaCha8PacketKey::new([0; 32])),
-                remote: Box::new(ChaCha8PacketKey::new([0; 32])),
+                local: Box::new(ChaCha8PacketKey::new([0; 44])),
+                remote: Box::new(ChaCha8PacketKey::new([0; 44])),
             },
         }
     }
