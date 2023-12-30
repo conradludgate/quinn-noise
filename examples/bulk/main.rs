@@ -80,10 +80,11 @@ async fn server(endpoint: quinn::Endpoint, opt: Opt) -> Result<()> {
                 };
                 trace!("stream established");
 
+                tokio::spawn(
+                    async move { drain_stream(&mut recv_stream, opt.read_unordered).await },
+                );
                 tokio::spawn(async move {
-                    drain_stream(&mut recv_stream, opt.read_unordered).await?;
-                    send_data_on_stream(&mut send_stream, opt.download_size).await?;
-                    Ok::<_, anyhow::Error>(())
+                    send_data_on_stream(&mut send_stream, opt.download_size).await
                 });
             }
 
@@ -181,13 +182,17 @@ async fn handle_client_stream(
         .await
         .context("failed to open stream")?;
 
-    send_data_on_stream(&mut send_stream, upload_size).await?;
+    let upload = tokio::spawn(async move {
+        send_data_on_stream(&mut send_stream, upload_size).await?;
+        Result::<_, anyhow::Error>::Ok(TransferResult::new(start.elapsed(), upload_size))
+    });
+    let download = tokio::spawn(async move {
+        let size = drain_stream(&mut recv_stream, read_unordered).await?;
+        Result::<_, anyhow::Error>::Ok(TransferResult::new(start.elapsed(), size as u64))
+    });
 
-    let upload_result = TransferResult::new(start.elapsed(), upload_size);
-
-    let start = Instant::now();
-    let size = drain_stream(&mut recv_stream, read_unordered).await?;
-    let download_result = TransferResult::new(start.elapsed(), size as u64);
+    let upload_result = upload.await??;
+    let download_result = download.await??;
 
     Ok((upload_result, download_result))
 }
