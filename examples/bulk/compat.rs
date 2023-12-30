@@ -157,6 +157,8 @@ pub fn transport_config(opt: &Opt) -> quinn::TransportConfig {
     // is configurable as a parameter.
     let mut config = quinn::TransportConfig::default();
     config.max_concurrent_uni_streams(opt.max_streams.try_into().unwrap());
+    config.initial_mtu(opt.initial_mtu);
+
     config
 }
 
@@ -190,6 +192,9 @@ pub struct Opt {
     /// Whether to use the unordered read API
     #[clap(long = "unordered")]
     pub read_unordered: bool,
+    /// Starting guess for maximum UDP payload size
+    #[clap(long, default_value = "1200")]
+    pub initial_mtu: u16,
 }
 
 fn parse_byte_size(s: &str) -> Result<u64, ParseIntError> {
