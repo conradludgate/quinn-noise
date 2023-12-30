@@ -1,4 +1,4 @@
-use crate::aead::{header_keypair, ChaCha8PacketKey, PlaintextHeaderKey};
+use crate::aead::{header_keypair, ChaCha20PacketKey, PlaintextHeaderKey};
 use crate::dh::DiffieHellman;
 use crate::keylog::KeyLog;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -10,7 +10,7 @@ use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
 use ring::aead;
 use std::any::Any;
-use std::convert::TryFrom;
+use std::convert::TryInto;
 use std::io::Cursor;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -116,8 +116,8 @@ impl ServerConfig for NoiseConfig {
         Ok(Keys {
             header: header_keypair(),
             packet: KeyPair {
-                local: Box::new(ChaCha8PacketKey::new([0; 44])),
-                remote: Box::new(ChaCha8PacketKey::new([0; 44])),
+                local: Box::new(ChaCha20PacketKey::new([0; 44])),
+                remote: Box::new(ChaCha20PacketKey::new([0; 44])),
             },
         })
     }
@@ -200,7 +200,7 @@ pub struct NoiseSession {
     remote_transport_parameters: Option<TransportParameters>,
     remote_e: Option<VerifyingKey>,
     remote_s: Option<VerifyingKey>,
-    zero_rtt_key: Option<ChaCha8PacketKey>,
+    zero_rtt_key: Option<ChaCha20PacketKey>,
     keylogger: Option<Arc<dyn KeyLog>>,
 }
 
@@ -231,7 +231,7 @@ fn connection_refused(reason: &str) -> TransportError {
 }
 
 impl NoiseSession {
-    fn next_1rtt_keys0(&mut self) -> KeyPair<ChaCha8PacketKey> {
+    fn next_1rtt_keys0(&mut self) -> KeyPair<ChaCha20PacketKey> {
         if !self.is_handshaking() {
             self.xoodyak.ratchet();
         }
@@ -243,8 +243,8 @@ impl NoiseSession {
             keylogger.log("CLIENT_KEY", &self.conn_id().unwrap(), &client[..]);
             keylogger.log("SERVER_KEY", &self.conn_id().unwrap(), &server[..]);
         }
-        let client = ChaCha8PacketKey::new(client);
-        let server = ChaCha8PacketKey::new(server);
+        let client = ChaCha20PacketKey::new(client);
+        let server = ChaCha20PacketKey::new(server);
         match self.side {
             Side::Client => KeyPair {
                 local: client,
@@ -258,13 +258,25 @@ impl NoiseSession {
     }
 }
 
+fn split(data: &[u8], n: usize) -> Result<(&[u8], &[u8]), TransportError> {
+    if data.len() < n {
+        Err(connection_refused("invalid crypto frame"))
+    } else {
+        Ok(data.split_at(n))
+    }
+}
+fn split_n<const N: usize>(data: &[u8]) -> Result<(&[u8; N], &[u8]), TransportError> {
+    let (n, data) = split(data, N)?;
+    Ok((n.try_into().unwrap(), data))
+}
+
 impl Session for NoiseSession {
     fn initial_keys(&self, _: &ConnectionId, _: Side) -> Keys {
         Keys {
             header: header_keypair(),
             packet: KeyPair {
-                local: Box::new(ChaCha8PacketKey::new([0; 44])),
-                remote: Box::new(ChaCha8PacketKey::new([0; 44])),
+                local: Box::new(ChaCha20PacketKey::new([0; 44])),
+                remote: Box::new(ChaCha20PacketKey::new([0; 44])),
             },
         }
     }
@@ -282,62 +294,50 @@ impl Session for NoiseSession {
         match (self.state, self.side) {
             (State::Initial, Side::Server) => {
                 // protocol identifier
-                if handshake.is_empty() {
-                    return Err(connection_refused("invalid crypto frame"));
-                }
-                let (len, rest) = handshake.split_at(1);
-                let len = len[0] as usize;
-                if rest.len() < len {
-                    return Err(connection_refused("invalid crypto frame"));
-                }
-                let (protocol_id, rest) = rest.split_at(len);
-                if protocol_id != b"Noise_IKpsk1_Edx25519_ChaCha8Poly" {
+                let (&[len], rest) = split_n(handshake)?;
+                let (protocol_id, rest) = split(rest, len as usize)?;
+                if protocol_id != b"Noise_IKpsk1_Edx25519_ChaCha20Poly_eratosthenes" {
                     return Err(connection_refused("unsupported protocol id"));
                 }
                 self.xoodyak.absorb(protocol_id);
+
                 // e
-                if rest.len() < 32 {
-                    return Err(connection_refused("invalid crypto frame"));
-                }
-                let (e, rest) = rest.split_at(32);
+                let (e, rest) = split_n(rest)?;
                 self.xoodyak.absorb(e);
-                let e = VerifyingKey::try_from(e)
+                let e = VerifyingKey::from_bytes(e)
                     .map_err(|_| connection_refused("invalid ephemeral public key"))?;
                 self.remote_e = Some(e);
+
                 // s
                 self.xoodyak.absorb(self.s.verifying_key().as_bytes());
+
                 // es
                 let es = self.s.diffie_hellman(&e);
                 self.xoodyak.absorb(&es);
+
                 // initialize keyed session transcript
                 let mut key = [0; 32];
                 self.xoodyak.squeeze(&mut key);
                 self.xoodyak = Xoodyak::keyed(&key, None, None, None);
+
                 // s
-                if rest.len() < 32 {
-                    return Err(connection_refused("invalid crypto frame"));
-                }
-                let (remote_s, rest) = rest.split_at(32);
+                let (remote_s, rest) = split_n::<32>(rest)?;
                 let mut s = [0; 32];
                 self.xoodyak.decrypt(remote_s, &mut s);
                 let s = VerifyingKey::from_bytes(&s)
                     .map_err(|_| connection_refused("invalid static public key"))?;
                 self.remote_s = Some(s);
+
                 // ss
                 let ss = self.s.diffie_hellman(&s);
                 self.xoodyak.absorb(&ss);
+
                 // psk
                 self.xoodyak.absorb(&self.psk);
+
                 // alpn
-                if rest.is_empty() {
-                    return Err(connection_refused("invalid crypto frame"));
-                }
-                let (len, rest) = rest.split_at(1);
-                let len = len[0] as usize;
-                if rest.len() < len {
-                    return Err(connection_refused("invalid crypto frame"));
-                }
-                let (alpn, rest) = rest.split_at(len);
+                let (&[len], rest) = split_n(rest)?;
+                let (alpn, rest) = split(rest, len as usize)?;
                 let mut alpn = alpn.to_vec();
                 self.xoodyak.decrypt_in_place(&mut alpn);
                 let is_supported = self
@@ -350,6 +350,7 @@ impl Session for NoiseSession {
                     return Err(connection_refused("unsupported alpn"));
                 }
                 self.alpn = Some(alpn);
+
                 // transport parameters
                 if rest.len() < 16 {
                     return Err(connection_refused("invalid crypto frame"));
@@ -357,6 +358,7 @@ impl Session for NoiseSession {
                 let (params, auth) = rest.split_at(rest.len() - 16);
                 let mut transport_parameters = vec![0; params.len()];
                 self.xoodyak.decrypt(params, &mut transport_parameters);
+
                 // check tag
                 let mut tag = [0; 16];
                 self.xoodyak.squeeze(&mut tag);
@@ -372,21 +374,21 @@ impl Session for NoiseSession {
             }
             (State::Handshake, Side::Client) => {
                 // e
-                if handshake.len() < 32 {
-                    return Err(connection_refused("invalid crypto frame"));
-                }
-                let (remote_e, rest) = handshake.split_at(32);
+                let (remote_e, rest) = split_n::<32>(handshake)?;
                 let mut e = [0; 32];
                 self.xoodyak.decrypt(remote_e, &mut e);
                 let e = VerifyingKey::from_bytes(&e)
                     .map_err(|_| connection_refused("invalid ephemeral public key"))?;
                 self.remote_e = Some(e);
+
                 // ee
                 let ee = self.e.diffie_hellman(&e);
                 self.xoodyak.absorb(&ee);
+
                 // se
                 let se = self.s.diffie_hellman(&e);
                 self.xoodyak.absorb(&se);
+
                 // transport parameters
                 if rest.len() < 16 {
                     return Err(connection_refused("invalid crypto frame"));
@@ -394,6 +396,7 @@ impl Session for NoiseSession {
                 let (params, auth) = rest.split_at(rest.len() - 16);
                 let mut transport_parameters = vec![0; params.len()];
                 self.xoodyak.decrypt(params, &mut transport_parameters);
+
                 // check tag
                 let mut tag = [0; 16];
                 self.xoodyak.squeeze(&mut tag);
@@ -420,49 +423,60 @@ impl Session for NoiseSession {
         match (self.state, self.side) {
             (State::Initial, Side::Client) => {
                 // protocol identifier
-                let protocol_id = b"Noise_IKpsk1_Edx25519_ChaCha8Poly";
+                let protocol_id = b"Noise_IKpsk1_Edx25519_ChaCha20Poly_eratosthenes";
                 self.xoodyak.absorb(protocol_id);
                 handshake.extend_from_slice(&[protocol_id.len() as u8]);
                 handshake.extend_from_slice(protocol_id);
+
                 // e
                 self.xoodyak.absorb(self.e.verifying_key().as_bytes());
                 handshake.extend_from_slice(self.e.verifying_key().as_bytes());
+
                 // s
                 let s = self.remote_s.unwrap();
                 self.xoodyak.absorb(s.as_bytes());
+
                 // es
                 let es = self.e.diffie_hellman(&s);
                 self.xoodyak.absorb(&es);
+
                 // initialize keyed session transcript
                 let mut key = [0; 32];
                 self.xoodyak.squeeze(&mut key);
                 self.xoodyak = Xoodyak::keyed(&key, None, None, None);
+
                 // s
                 let mut s = [0; 32];
                 self.xoodyak
                     .encrypt(self.s.verifying_key().as_bytes(), &mut s);
                 handshake.extend_from_slice(&s);
+
                 // ss
                 let s = self.remote_s.unwrap();
                 let ss = self.s.diffie_hellman(&s);
                 self.xoodyak.absorb(&ss);
+
                 // psk
                 self.xoodyak.absorb(&self.psk);
+
                 // alpn
                 let alpn = self.alpn.as_ref().expect("invalid config");
                 handshake.extend_from_slice(&[alpn.len() as u8]);
                 let pos = handshake.len();
                 handshake.extend_from_slice(alpn);
                 self.xoodyak.encrypt_in_place(&mut handshake[pos..]);
+
                 // transport parameters
                 let mut transport_parameters = vec![];
                 self.transport_parameters.write(&mut transport_parameters);
                 self.xoodyak.encrypt_in_place(&mut transport_parameters);
                 handshake.extend_from_slice(&transport_parameters);
+
                 // tag
                 let mut tag = [0; 16];
                 self.xoodyak.squeeze(&mut tag);
                 handshake.extend_from_slice(&tag);
+
                 // 0-rtt
                 self.state = State::ZeroRtt;
                 None
@@ -485,21 +499,26 @@ impl Session for NoiseSession {
                 self.xoodyak
                     .encrypt(self.e.verifying_key().as_bytes(), &mut e);
                 handshake.extend_from_slice(&e);
+
                 // ee
                 let ee = self.e.diffie_hellman(&self.remote_e.unwrap());
                 self.xoodyak.absorb(&ee);
+
                 // se
                 let se = self.e.diffie_hellman(&self.remote_s.unwrap());
                 self.xoodyak.absorb(&se);
+
                 // transport parameters
                 let mut transport_parameters = vec![];
                 self.transport_parameters.write(&mut transport_parameters);
                 self.xoodyak.encrypt_in_place(&mut transport_parameters);
                 handshake.extend_from_slice(&transport_parameters);
+
                 // tag
                 let mut tag = [0; 16];
                 self.xoodyak.squeeze(&mut tag);
                 handshake.extend_from_slice(&tag);
+
                 // 1-rtt keys
                 let packet = self.next_1rtt_keys().unwrap();
                 self.state = State::Data;

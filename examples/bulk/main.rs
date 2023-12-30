@@ -23,8 +23,8 @@ fn main() {
     configure_tracing_subscriber();
 
     let mut csprng = rand::rngs::OsRng {};
-    let keypair: ed25519_dalek::SigningKey = ed25519_dalek::SigningKey::generate(&mut csprng);
-    let public_key: ed25519_dalek::VerifyingKey = keypair.verifying_key();
+    let keypair = ed25519_dalek::SigningKey::generate(&mut csprng);
+    let public_key = keypair.verifying_key();
 
     let runtime = rt();
     let (server_addr, endpoint) = server_endpoint(&runtime, keypair, &opt);

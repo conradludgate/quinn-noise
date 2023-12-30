@@ -12,12 +12,12 @@ pub fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
 }
 
 #[derive(Clone)]
-pub struct ChaCha8PacketKey {
+pub struct ChaCha20PacketKey {
     key: aead::LessSafeKey,
     iv: [u8; 12],
 }
 
-impl ChaCha8PacketKey {
+impl ChaCha20PacketKey {
     pub fn new(key: [u8; 44]) -> Self {
         let (key, iv) = key.split_at(32);
         let iv = iv.try_into().unwrap();
@@ -30,7 +30,7 @@ impl ChaCha8PacketKey {
     }
 }
 
-impl PacketKey for ChaCha8PacketKey {
+impl PacketKey for ChaCha20PacketKey {
     fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
         let (header, payload_tag) = buf.split_at_mut(header_len);
         let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - self.tag_len());

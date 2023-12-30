@@ -2,7 +2,6 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek as ed25519;
 use sha2::{Digest, Sha512};
 use x25519_dalek as x25519;
-use zeroize::Zeroize;
 
 pub trait DiffieHellman {
     type PublicKey;
@@ -40,9 +39,7 @@ fn ed25519_to_x25519_sk(ed25519_sk: &ed25519::SecretKey) -> x25519::StaticSecret
     let mut curve25519_sk: [u8; 32] = [0; 32];
     let hash = Sha512::digest(ed25519_sk.as_ref());
     curve25519_sk.copy_from_slice(&hash[..32]);
-    let sk = x25519::StaticSecret::from(curve25519_sk); // Copy
-    curve25519_sk.zeroize();
-    sk
+    x25519::StaticSecret::from(curve25519_sk)
 }
 
 /// Construct a curve25519 public key from an Ed25519 public key.

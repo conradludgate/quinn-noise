@@ -1,7 +1,8 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io;
 use std::io::Write;
+use std::io::{self, BufWriter};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -55,7 +56,7 @@ impl KeyLogFile {
     /// Makes a new `KeyLogFile`.  The environment variable is
     /// inspected and the named file is opened during this call.
     pub fn new() -> Self {
-        let var = env::var("SSLKEYLOGFILE");
+        let var = env::var_os("SSLKEYLOGFILE");
         KeyLogFile(Mutex::new(KeyLogFileInner::new(var)))
     }
 }
@@ -84,86 +85,65 @@ impl KeyLog for KeyLogFile {
 
 // Internal mutable state for KeyLogFile
 struct KeyLogFileInner {
-    file: Option<File>,
-    buf: Vec<u8>,
+    file: Option<BufWriter<File>>,
 }
 
 impl KeyLogFileInner {
-    fn new(var: Result<String, env::VarError>) -> Self {
-        let path = match var {
-            Ok(ref s) => Path::new(s),
-            Err(env::VarError::NotUnicode(ref s)) => Path::new(s),
-            Err(env::VarError::NotPresent) => {
-                return KeyLogFileInner {
-                    file: None,
-                    buf: Vec::new(),
-                };
-            }
+    fn new(var: Option<OsString>) -> Self {
+        let Some(path) = var else {
+            return KeyLogFileInner { file: None };
         };
+        let path = Path::new(&path);
 
         let file = match OpenOptions::new().append(true).create(true).open(path) {
-            Ok(f) => Some(f),
+            Ok(f) => Some(BufWriter::new(f)),
             Err(e) => {
                 tracing::warn!("unable to create key log file {:?}: {}", path, e);
                 None
             }
         };
 
-        KeyLogFileInner {
-            file,
-            buf: Vec::new(),
-        }
+        KeyLogFileInner { file }
     }
 
     fn try_write(&mut self, label: &str, client_random: &[u8], secret: &[u8]) -> io::Result<()> {
-        let mut file = match self.file {
-            None => {
-                return Ok(());
-            }
-            Some(ref f) => f,
+        let Some(ref mut file) = self.file else {
+            return Ok(());
         };
 
-        self.buf.truncate(0);
-        write!(self.buf, "{} ", label)?;
+        write!(file, "{label} ")?;
         for b in client_random.iter() {
-            write!(self.buf, "{:02x}", b)?;
+            write!(file, "{:02x}", b)?;
         }
-        write!(self.buf, " ")?;
+        write!(file, " ")?;
         for b in secret.iter() {
-            write!(self.buf, "{:02x}", b)?;
+            write!(file, "{:02x}", b)?;
         }
-        writeln!(self.buf)?;
-        file.write_all(&self.buf)
+        writeln!(file)
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, target_family = "unix"))]
 mod test {
     use super::*;
 
     #[test]
-    fn test_env_var_is_not_unicode() {
-        let mut inner = KeyLogFileInner::new(Err(env::VarError::NotUnicode(
-            "/tmp/keylogfileinnertest".into(),
-        )));
-        assert!(inner.try_write("label", b"random", b"secret").is_ok());
-    }
-
-    #[test]
     fn test_env_var_is_not_set() {
-        let mut inner = KeyLogFileInner::new(Err(env::VarError::NotPresent));
+        let mut inner = KeyLogFileInner::new(None);
         assert!(inner.try_write("label", b"random", b"secret").is_ok());
     }
 
     #[test]
     fn test_env_var_cannot_be_opened() {
-        let mut inner = KeyLogFileInner::new(Ok("/dev/does-not-exist".into()));
+        let mut inner = KeyLogFileInner::new(Some("/dev/does-not-exist".into()));
         assert!(inner.try_write("label", b"random", b"secret").is_ok());
     }
 
+    // doesn't seem to fail on macos
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_env_var_cannot_be_written() {
-        let mut inner = KeyLogFileInner::new(Ok("/dev/full".into()));
+        let mut inner = KeyLogFileInner::new(Some("/dev/full".into()));
         assert!(inner.try_write("label", b"random", b"secret").is_err());
     }
 }
