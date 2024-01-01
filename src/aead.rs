@@ -1,8 +1,8 @@
-use std::convert::TryInto;
+use std::convert::TryFrom;
 
 use bytes::BytesMut;
 use quinn_proto::crypto::{CryptoError, HeaderKey, KeyPair, PacketKey};
-use ring::aead;
+use ring::aead::{self, Tag};
 
 pub fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
     KeyPair {
@@ -18,21 +18,24 @@ pub struct ChaCha20PacketKey {
 }
 
 impl ChaCha20PacketKey {
-    pub fn new(key: [u8; 44]) -> Self {
-        let (key, iv) = key.split_at(32);
-        let iv = iv.try_into().unwrap();
+    pub fn new(key: [u8; 32]) -> Self {
+        let mut iv = [0; 12];
+        blake3::Hasher::new_derive_key("quic-noise iv")
+            .update(&key)
+            .finalize_xof()
+            .fill(&mut iv);
+        let key = blake3::derive_key("quic-noise key", &key);
         Self {
             key: aead::LessSafeKey::new(
-                aead::UnboundKey::new(&aead::CHACHA20_POLY1305, key).unwrap(),
+                aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).unwrap(),
             ),
             iv,
         }
     }
 }
 
-impl PacketKey for ChaCha20PacketKey {
-    fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
-        let (header, payload_tag) = buf.split_at_mut(header_len);
+impl ChaCha20PacketKey {
+    pub fn encrypt_ad(&self, packet: u64, header: &[u8], payload_tag: &mut [u8]) {
         let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - self.tag_len());
 
         let aad = aead::Aad::from(header);
@@ -45,22 +48,41 @@ impl PacketKey for ChaCha20PacketKey {
         tag_storage.copy_from_slice(tag.as_ref());
     }
 
+    pub fn decrypt_ad(
+        &self,
+        packet: u64,
+        header: &[u8],
+        tag: &[u8],
+        payload: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        let aad = aead::Aad::from(header);
+        let nonce = nonce_for(packet, &self.iv);
+        let tag = Tag::try_from(tag).map_err(|_| CryptoError)?;
+
+        self.key
+            .open_in_place_separate_tag(nonce, aad, tag, payload, 0..)
+            .map_err(|_| CryptoError)?;
+
+        Ok(())
+    }
+}
+
+impl PacketKey for ChaCha20PacketKey {
+    fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
+        let (header, payload_tag) = buf.split_at_mut(header_len);
+        self.encrypt_ad(packet, header, payload_tag)
+    }
+
     fn decrypt(
         &self,
         packet: u64,
         header: &[u8],
-        payload: &mut BytesMut,
+        payload_tag: &mut BytesMut,
     ) -> Result<(), CryptoError> {
-        let payload_len = payload.len();
-        let aad = aead::Aad::from(header);
-        let nonce = nonce_for(packet, &self.iv);
-
-        self.key
-            .open_in_place(nonce, aad, payload)
-            .map_err(|_| CryptoError)?;
-
-        let plain_len = payload_len - self.key.algorithm().tag_len();
-        payload.truncate(plain_len);
+        let plain_len = payload_tag.len() - self.tag_len();
+        let (payload, tag_storage) = payload_tag.split_at_mut(plain_len);
+        self.decrypt_ad(packet, header, tag_storage, payload)?;
+        payload_tag.truncate(plain_len);
         Ok(())
     }
 

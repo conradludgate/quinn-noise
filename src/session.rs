@@ -3,8 +3,8 @@ use crate::dh::DiffieHellman;
 use crate::keylog::KeyLog;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn_proto::crypto::{
-    ClientConfig, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, ServerConfig,
-    Session,
+    ClientConfig, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey,
+    ServerConfig, Session,
 };
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
@@ -13,8 +13,6 @@ use std::any::Any;
 use std::convert::TryInto;
 use std::io::Cursor;
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
-use xoodoo::Xoodyak;
 
 pub struct NoiseClientConfig {
     /// Keypair to use.
@@ -25,8 +23,8 @@ pub struct NoiseClientConfig {
     pub keylogger: Option<Arc<dyn KeyLog>>,
     /// The remote public key. This needs to be set.
     pub remote_public_key: VerifyingKey,
-    /// ALPN string to use.
-    pub alpn: Vec<u8>,
+    /// Requested ALPN identifiers.
+    pub requested_protocols: Vec<Vec<u8>>,
 }
 
 impl From<NoiseClientConfig> for NoiseConfig {
@@ -36,8 +34,8 @@ impl From<NoiseClientConfig> for NoiseConfig {
             psk: config.psk,
             keylogger: config.keylogger,
             remote_public_key: Some(config.remote_public_key),
-            alpn: Some(config.alpn),
-            supported_protocols: None,
+            requested_protocols: config.requested_protocols,
+            supported_protocols: vec![],
         }
     }
 }
@@ -60,8 +58,8 @@ impl From<NoiseServerConfig> for NoiseConfig {
             psk: config.psk,
             keylogger: config.keylogger,
             remote_public_key: None,
-            alpn: None,
-            supported_protocols: Some(config.supported_protocols),
+            requested_protocols: vec![],
+            supported_protocols: config.supported_protocols,
         }
     }
 }
@@ -77,10 +75,10 @@ pub struct NoiseConfig {
     keylogger: Option<Arc<dyn KeyLog>>,
     /// The remote public key. This needs to be set.
     remote_public_key: Option<VerifyingKey>,
-    /// ALPN string to use.
-    alpn: Option<Vec<u8>>,
+    /// Requested ALPN identifiers.
+    requested_protocols: Vec<Vec<u8>>,
     /// Supported ALPN identifiers.
-    supported_protocols: Option<Vec<Vec<u8>>>,
+    supported_protocols: Vec<Vec<u8>>,
 }
 
 impl ClientConfig for NoiseConfig {
@@ -116,8 +114,8 @@ impl ServerConfig for NoiseConfig {
         Ok(Keys {
             header: header_keypair(),
             packet: KeyPair {
-                local: Box::new(ChaCha20PacketKey::new([0; 44])),
-                remote: Box::new(ChaCha20PacketKey::new([0; 44])),
+                local: Box::new(ChaCha20PacketKey::new([0; 32])),
+                remote: Box::new(ChaCha20PacketKey::new([0; 32])),
             },
         })
     }
@@ -151,21 +149,29 @@ impl NoiseConfig {
             SigningKey::generate(&mut rng)
         };
         let e = SigningKey::generate(&mut rng);
+
+        let mut symmetricstate = SymmetricState::initialize_symmetric(PROTOCOL_ID.as_bytes());
+
+        // <- s
+        match side {
+            Side::Server => symmetricstate.mix_hash(s.as_bytes()),
+            Side::Client => symmetricstate.mix_hash(self.remote_public_key.unwrap().as_bytes()),
+        }
+
         NoiseSession {
-            xoodyak: Xoodyak::hash(),
+            symmetricstate,
+            next_keys: None,
             state: State::Initial,
             side,
             e,
             s,
-            psk: self.psk.unwrap_or_default(),
-            alpn: self.alpn.clone(),
+            requested_protocols: self.requested_protocols.clone(),
             supported_protocols: self.supported_protocols.clone(),
             transport_parameters: *params,
             remote_transport_parameters: None,
             remote_e: None,
             remote_s: self.remote_public_key,
             zero_rtt_key: None,
-            keylogger: self.keylogger.clone(),
         }
     }
 }
@@ -181,37 +187,174 @@ impl Clone for NoiseConfig {
             psk: self.psk,
             keylogger: self.keylogger.clone(),
             remote_public_key: self.remote_public_key,
-            alpn: self.alpn.clone(),
+            requested_protocols: self.requested_protocols.clone(),
             supported_protocols: self.supported_protocols.clone(),
         }
     }
 }
 
+const PROTOCOL_ID: &str = "Noise_IK_25519_ChaChaPoly_BLAKE3";
+
+#[derive(Copy, Clone, Default)]
+pub(crate) struct SymmetricStateData {}
+
+pub(crate) struct SymmetricState {
+    cipherstate: Option<ChaCha20PacketKey>,
+    h: [u8; 32],
+    ck: [u8; 32],
+}
+
+impl SymmetricState {
+    pub fn initialize_symmetric(protocol_id: &[u8]) -> Self {
+        let h = blake3::hash(protocol_id).into();
+        Self {
+            h,
+            ck: h,
+            cipherstate: None,
+        }
+    }
+
+    pub fn mix_key(&mut self, input_key_material: &[u8]) {
+        // Sets ck, temp_k = HKDF(ck, input_key_material, 2).
+        // If HASHLEN is 64, then truncates temp_k to 32 bytes.
+        // Calls InitializeKey(temp_k).
+        let mut bytes = blake3::Hasher::new_derive_key(PROTOCOL_ID)
+            .update(&self.ck)
+            .update(input_key_material)
+            .finalize_xof();
+        bytes.fill(&mut self.ck);
+        let mut cipher = [0; 32];
+        bytes.fill(&mut cipher);
+        self.cipherstate = Some(ChaCha20PacketKey::new(cipher));
+    }
+
+    pub fn mix_hash(&mut self, data: &[u8]) {
+        self.h = blake3::Hasher::new()
+            .update(&self.h)
+            .update(data)
+            .finalize()
+            .into();
+    }
+
+    // pub fn mix_key_and_hash(&mut self, input_key_material: &[u8]) {
+    //     // Sets ck, temp_h, temp_k = HKDF(ck, input_key_material, 3).
+    //     // Calls MixHash(temp_h).
+    //     // If HASHLEN is 64, then truncates temp_k to 32 bytes.
+    //     // Calls InitializeKey(temp_k).
+    //     let mut bytes = blake3::Hasher::new_derive_key(PROTOCOL_ID)
+    //         .update(&self.ck)
+    //         .update(input_key_material)
+    //         .finalize_xof();
+
+    //     let mut mix = [0; 32];
+    //     let mut cipher = [0; 32];
+    //     bytes.fill(&mut self.ck);
+    //     bytes.fill(&mut mix);
+    //     bytes.fill(&mut cipher);
+
+    //     self.mix_hash(&mix);
+    //     self.cipherstate = Some(ChaCha20PacketKey::new(cipher));
+    // }
+
+    /// Encrypt a message and mixes in the hash of the output
+    pub fn encrypt_and_hash(&mut self, nonce: u64, plaintext: &[u8], buffer: &mut [u8]) -> usize {
+        buffer[..plaintext.len()].copy_from_slice(plaintext);
+        let output_len = if let Some(cipher) = &self.cipherstate {
+            cipher.encrypt_ad(nonce, &self.h, &mut buffer[..plaintext.len() + 16]);
+            plaintext.len() + 16
+        } else {
+            plaintext.len()
+        };
+        self.mix_hash(&buffer[..output_len]);
+        output_len
+    }
+
+    pub fn decrypt_and_hash(
+        &mut self,
+        nonce: u64,
+        ciphertext: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        let payload_len = if let Some(cipher) = &self.cipherstate {
+            let (ciphertext, tag) = ciphertext.split_at(ciphertext.len() - 16);
+            buffer[..ciphertext.len()].copy_from_slice(ciphertext);
+            cipher.decrypt_ad(nonce, &self.h, tag, &mut buffer[..ciphertext.len()])?;
+            ciphertext.len()
+        } else {
+            buffer[..ciphertext.len()].copy_from_slice(ciphertext);
+            ciphertext.len()
+        };
+        self.mix_hash(ciphertext);
+        Ok(payload_len)
+    }
+
+    pub fn split(&mut self) -> ([u8; 32], [u8; 32]) {
+        let mut bytes = blake3::Hasher::new_derive_key(PROTOCOL_ID)
+            .update(&self.ck)
+            .finalize_xof();
+
+        let mut temp_k1 = [0; 32];
+        let mut temp_k2 = [0; 32];
+        bytes.fill(&mut temp_k1);
+        bytes.fill(&mut temp_k2);
+
+        (temp_k1, temp_k2)
+    }
+}
+
+// fn kdf(
+//     chaining_key: &[u8],
+//     input_key_material: &[u8],
+//     outputs: usize,
+//     out1: &mut [u8],
+//     out2: &mut [u8],
+//     out3: &mut [u8],) {
+//     // TODO: not actually a hmac, will rename later
+
+//     assert!(key.len() <= 128);
+//     let block_len = 128;
+//     let hash_len = self.hash_len();
+//     let mut ipad = [0x36u8; MAXBLOCKLEN];
+//     let mut opad = [0x5cu8; MAXBLOCKLEN];
+//     for count in 0..key.len() {
+//         ipad[count] ^= key[count];
+//         opad[count] ^= key[count];
+//     }
+//     self.reset();
+//     self.input(&ipad[..block_len]);
+//     self.input(data);
+//     let mut inner_output = [0u8; MAXHASHLEN];
+//     self.result(&mut inner_output);
+//     self.reset();
+//     self.input(&opad[..block_len]);
+//     self.input(&inner_output[..hash_len]);
+//     self.result(out);
+// }
+
 pub struct NoiseSession {
-    xoodyak: Xoodyak,
+    symmetricstate: SymmetricState,
+    next_keys: Option<KeyPair<[u8; 32]>>,
     state: State,
     side: Side,
     e: SigningKey,
     s: SigningKey,
-    psk: [u8; 32],
-    alpn: Option<Vec<u8>>,
-    supported_protocols: Option<Vec<Vec<u8>>>,
+    requested_protocols: Vec<Vec<u8>>,
+    supported_protocols: Vec<Vec<u8>>,
     transport_parameters: TransportParameters,
     remote_transport_parameters: Option<TransportParameters>,
     remote_e: Option<VerifyingKey>,
     remote_s: Option<VerifyingKey>,
     zero_rtt_key: Option<ChaCha20PacketKey>,
-    keylogger: Option<Arc<dyn KeyLog>>,
 }
 
-impl NoiseSession {
-    fn conn_id(&self) -> Option<[u8; 32]> {
-        match self.side {
-            Side::Client => Some(self.e.verifying_key().to_bytes()),
-            Side::Server => Some(self.remote_e.as_ref()?.to_bytes()),
-        }
-    }
-}
+// impl NoiseSession {
+//     fn conn_id(&self) -> Option<[u8; 32]> {
+//         match self.side {
+//             Side::Client => Some(self.e.verifying_key().to_bytes()),
+//             Side::Server => Some(self.remote_e.as_ref()?.to_bytes()),
+//         }
+//     }
+// }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
@@ -230,33 +373,34 @@ fn connection_refused(reason: &str) -> TransportError {
     }
 }
 
-impl NoiseSession {
-    fn next_1rtt_keys0(&mut self) -> KeyPair<ChaCha20PacketKey> {
-        if !self.is_handshaking() {
-            self.xoodyak.ratchet();
-        }
-        let mut client = [0; 44];
-        self.xoodyak.squeeze_key(&mut client);
-        let mut server = [0; 44];
-        self.xoodyak.squeeze_key(&mut server);
-        if let Some(keylogger) = self.keylogger.as_ref() {
-            keylogger.log("CLIENT_KEY", &self.conn_id().unwrap(), &client[..]);
-            keylogger.log("SERVER_KEY", &self.conn_id().unwrap(), &server[..]);
-        }
-        let client = ChaCha20PacketKey::new(client);
-        let server = ChaCha20PacketKey::new(server);
-        match self.side {
-            Side::Client => KeyPair {
-                local: client,
-                remote: server,
-            },
-            Side::Server => KeyPair {
-                local: server,
-                remote: client,
-            },
-        }
-    }
-}
+// impl NoiseSession {
+//     fn next_1rtt_keys0(&mut self) -> KeyPair<ChaCha20PacketKey> {
+
+//         if !self.is_handshaking() {
+//             self.xoodyak.ratchet();
+//         }
+//         let mut client = [0; 44];
+//         self.xoodyak.squeeze_key(&mut client);
+//         let mut server = [0; 44];
+//         self.xoodyak.squeeze_key(&mut server);
+//         if let Some(keylogger) = self.keylogger.as_ref() {
+//             keylogger.log("CLIENT_KEY", &self.conn_id().unwrap(), &client[..]);
+//             keylogger.log("SERVER_KEY", &self.conn_id().unwrap(), &server[..]);
+//         }
+//         let client = ChaCha20PacketKey::new(client);
+//         let server = ChaCha20PacketKey::new(server);
+//         match self.side {
+//             Side::Client => KeyPair {
+//                 local: client,
+//                 remote: server,
+//             },
+//             Side::Server => KeyPair {
+//                 local: server,
+//                 remote: client,
+//             },
+//         }
+//     }
+// }
 
 fn split(data: &[u8], n: usize) -> Result<(&[u8], &[u8]), TransportError> {
     if data.len() < n {
@@ -275,17 +419,22 @@ impl Session for NoiseSession {
         Keys {
             header: header_keypair(),
             packet: KeyPair {
-                local: Box::new(ChaCha20PacketKey::new([0; 44])),
-                remote: Box::new(ChaCha20PacketKey::new([0; 44])),
+                local: Box::new(ChaCha20PacketKey::new([0; 32])),
+                remote: Box::new(ChaCha20PacketKey::new([0; 32])),
             },
         }
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        let key = self.next_1rtt_keys0();
+        let KeyPair { local, remote } = *self.next_keys.as_ref()?;
+        self.next_keys = Some(KeyPair {
+            local: blake3::derive_key("update key", &local),
+            remote: blake3::derive_key("update key", &remote),
+        });
+
         Some(KeyPair {
-            local: Box::new(key.local),
-            remote: Box::new(key.remote),
+            local: Box::new(ChaCha20PacketKey::new(local)),
+            remote: Box::new(ChaCha20PacketKey::new(remote)),
         })
     }
 
@@ -293,122 +442,112 @@ impl Session for NoiseSession {
         tracing::trace!("read_handshake {:?} {:?}", self.state, self.side);
         match (self.state, self.side) {
             (State::Initial, Side::Server) => {
-                // protocol identifier
-                let (&[len], rest) = split_n(handshake)?;
-                let (protocol_id, rest) = split(rest, len as usize)?;
-                if protocol_id != b"Noise_IKpsk1_Edx25519_ChaCha20Poly_eratosthenes" {
-                    return Err(connection_refused("unsupported protocol id"));
-                }
-                self.xoodyak.absorb(protocol_id);
-
-                // e
-                let (e, rest) = split_n(rest)?;
-                self.xoodyak.absorb(e);
-                let e = VerifyingKey::from_bytes(e)
+                // -> e
+                let (re, rest) = split_n(handshake)?;
+                self.symmetricstate.mix_hash(re);
+                let re = VerifyingKey::from_bytes(re)
                     .map_err(|_| connection_refused("invalid ephemeral public key"))?;
-                self.remote_e = Some(e);
+                self.remote_e = Some(re);
 
-                // s
-                self.xoodyak.absorb(self.s.verifying_key().as_bytes());
+                // -> es
+                let es = self.s.diffie_hellman(&re);
+                self.symmetricstate.mix_key(&es);
 
-                // es
-                let es = self.s.diffie_hellman(&e);
-                self.xoodyak.absorb(&es);
-
-                // initialize keyed session transcript
-                let mut key = [0; 32];
-                self.xoodyak.squeeze(&mut key);
-                self.xoodyak = Xoodyak::keyed(&key, None, None, None);
-
-                // s
-                let (remote_s, rest) = split_n::<32>(rest)?;
-                let mut s = [0; 32];
-                self.xoodyak.decrypt(remote_s, &mut s);
-                let s = VerifyingKey::from_bytes(&s)
+                // -> s
+                let (remote_s, rest) = split_n::<48>(rest)?;
+                let mut rs = [0; 32];
+                // self.xoodyak.decrypt(remote_s, &mut s);
+                self.symmetricstate
+                    .decrypt_and_hash(0, remote_s, &mut rs)
                     .map_err(|_| connection_refused("invalid static public key"))?;
-                self.remote_s = Some(s);
+                let rs = VerifyingKey::from_bytes(&rs)
+                    .map_err(|_| connection_refused("invalid static public key"))?;
+                self.remote_s = Some(rs);
 
-                // ss
-                let ss = self.s.diffie_hellman(&s);
-                self.xoodyak.absorb(&ss);
+                // -> ss
+                let ss = self.s.diffie_hellman(&rs);
+                self.symmetricstate.mix_key(&ss);
 
-                // psk
-                self.xoodyak.absorb(&self.psk);
+                // // psk
+                // self.xoodyak.absorb(&self.psk);
+
+                // payload
+                let mut payload = vec![0; rest.len() - 16];
+                self.symmetricstate
+                    .decrypt_and_hash(0, rest, &mut payload)
+                    .map_err(|_| connection_refused("invalid static public key"))?;
+
+                // alpn
+                let (&[len], rest) = split_n(rest)?;
+                let (mut alpns, rest) = split(rest, len as usize)?;
+
+                if !self.supported_protocols.is_empty() {
+                    let mut is_supported = false;
+                    while !alpns.is_empty() {
+                        let (&[len], next) = split_n(alpns)?;
+                        let (alpn, next_alpn) = split(next, len as usize)?;
+                        alpns = next_alpn;
+                        let found = self
+                            .supported_protocols
+                            .iter()
+                            .any(|proto| proto.as_slice() == alpn);
+
+                        if found {
+                            self.requested_protocols.push(alpn.to_vec());
+                            is_supported = true;
+                            break;
+                        }
+                    }
+                    if !is_supported {
+                        return Err(connection_refused("unsupported alpn"));
+                    }
+                }
+
+                self.remote_transport_parameters = Some(TransportParameters::read(
+                    Side::Server,
+                    &mut Cursor::new(&rest),
+                )?);
+                self.state = State::ZeroRtt;
+                Ok(!self.requested_protocols.is_empty())
+            }
+            (State::Handshake, Side::Client) => {
+                // <- e
+                let (re, rest) = split_n::<32>(handshake)?;
+                self.symmetricstate.mix_hash(re);
+                let re = VerifyingKey::from_bytes(re)
+                    .map_err(|_| connection_refused("invalid ephemeral public key"))?;
+                self.remote_e = Some(re);
+
+                // <- ee
+                let ee = self.e.diffie_hellman(&re);
+                self.symmetricstate.mix_key(&ee);
+
+                // <- se
+                let se = self.s.diffie_hellman(&re);
+                self.symmetricstate.mix_key(&se);
+
+                // payload
+                let mut payload = vec![0; rest.len() - 16];
+                self.symmetricstate
+                    .decrypt_and_hash(1, rest, &mut payload)
+                    .map_err(|_| connection_refused("invalid static public key"))?;
 
                 // alpn
                 let (&[len], rest) = split_n(rest)?;
                 let (alpn, rest) = split(rest, len as usize)?;
-                let mut alpn = alpn.to_vec();
-                self.xoodyak.decrypt_in_place(&mut alpn);
-                let is_supported = self
-                    .supported_protocols
-                    .as_ref()
-                    .expect("invalid config")
-                    .iter()
-                    .any(|proto| proto.as_slice() == alpn);
-                if !is_supported {
-                    return Err(connection_refused("unsupported alpn"));
+                if !self.requested_protocols.is_empty() {
+                    if alpn.is_empty() {
+                        return Err(connection_refused("unsupported alpn"));
+                    }
+                    self.requested_protocols.retain(|a| a == alpn);
                 }
-                self.alpn = Some(alpn);
 
-                // transport parameters
-                if rest.len() < 16 {
-                    return Err(connection_refused("invalid crypto frame"));
-                }
-                let (params, auth) = rest.split_at(rest.len() - 16);
-                let mut transport_parameters = vec![0; params.len()];
-                self.xoodyak.decrypt(params, &mut transport_parameters);
-
-                // check tag
-                let mut tag = [0; 16];
-                self.xoodyak.squeeze(&mut tag);
-                if !bool::from(tag.ct_eq(auth)) {
-                    return Err(connection_refused("invalid authentication tag"));
-                }
                 self.remote_transport_parameters = Some(TransportParameters::read(
                     Side::Server,
-                    &mut Cursor::new(&mut transport_parameters),
-                )?);
-                self.state = State::ZeroRtt;
-                Ok(true)
-            }
-            (State::Handshake, Side::Client) => {
-                // e
-                let (remote_e, rest) = split_n::<32>(handshake)?;
-                let mut e = [0; 32];
-                self.xoodyak.decrypt(remote_e, &mut e);
-                let e = VerifyingKey::from_bytes(&e)
-                    .map_err(|_| connection_refused("invalid ephemeral public key"))?;
-                self.remote_e = Some(e);
-
-                // ee
-                let ee = self.e.diffie_hellman(&e);
-                self.xoodyak.absorb(&ee);
-
-                // se
-                let se = self.s.diffie_hellman(&e);
-                self.xoodyak.absorb(&se);
-
-                // transport parameters
-                if rest.len() < 16 {
-                    return Err(connection_refused("invalid crypto frame"));
-                }
-                let (params, auth) = rest.split_at(rest.len() - 16);
-                let mut transport_parameters = vec![0; params.len()];
-                self.xoodyak.decrypt(params, &mut transport_parameters);
-
-                // check tag
-                let mut tag = [0; 16];
-                self.xoodyak.squeeze(&mut tag);
-                if !bool::from(tag.ct_eq(auth)) {
-                    return Err(connection_refused("invalid authentication tag"));
-                }
-                self.remote_transport_parameters = Some(TransportParameters::read(
-                    Side::Client,
-                    &mut Cursor::new(&mut transport_parameters),
+                    &mut Cursor::new(&rest),
                 )?);
                 self.state = State::OneRtt;
-                Ok(true)
+                Ok(!self.requested_protocols.is_empty())
             }
             _ => Err(TransportError {
                 code: TransportErrorCode::CONNECTION_REFUSED,
@@ -422,104 +561,106 @@ impl Session for NoiseSession {
         tracing::trace!("write_handshake {:?} {:?}", self.state, self.side);
         match (self.state, self.side) {
             (State::Initial, Side::Client) => {
-                // protocol identifier
-                let protocol_id = b"Noise_IKpsk1_Edx25519_ChaCha20Poly_eratosthenes";
-                self.xoodyak.absorb(protocol_id);
-                handshake.extend_from_slice(&[protocol_id.len() as u8]);
-                handshake.extend_from_slice(protocol_id);
-
-                // e
-                self.xoodyak.absorb(self.e.verifying_key().as_bytes());
+                // -> e
+                self.symmetricstate
+                    .mix_hash(self.e.verifying_key().as_bytes());
                 handshake.extend_from_slice(self.e.verifying_key().as_bytes());
 
-                // s
-                let s = self.remote_s.unwrap();
-                self.xoodyak.absorb(s.as_bytes());
+                // -> es
+                let es = self.e.diffie_hellman(&self.remote_s.unwrap());
+                self.symmetricstate.mix_key(&es);
 
-                // es
-                let es = self.e.diffie_hellman(&s);
-                self.xoodyak.absorb(&es);
-
-                // initialize keyed session transcript
-                let mut key = [0; 32];
-                self.xoodyak.squeeze(&mut key);
-                self.xoodyak = Xoodyak::keyed(&key, None, None, None);
-
-                // s
-                let mut s = [0; 32];
-                self.xoodyak
-                    .encrypt(self.s.verifying_key().as_bytes(), &mut s);
+                // -> s
+                let mut s = [0; 48];
+                self.symmetricstate
+                    .encrypt_and_hash(0, self.s.verifying_key().as_bytes(), &mut s);
                 handshake.extend_from_slice(&s);
 
-                // ss
+                // -> ss
                 let s = self.remote_s.unwrap();
                 let ss = self.s.diffie_hellman(&s);
-                self.xoodyak.absorb(&ss);
+                self.symmetricstate.mix_key(&ss);
 
-                // psk
-                self.xoodyak.absorb(&self.psk);
+                // payload
+                let mut payload = vec![];
 
                 // alpn
-                let alpn = self.alpn.as_ref().expect("invalid config");
-                handshake.extend_from_slice(&[alpn.len() as u8]);
-                let pos = handshake.len();
-                handshake.extend_from_slice(alpn);
-                self.xoodyak.encrypt_in_place(&mut handshake[pos..]);
+                payload.extend_from_slice(&(self.requested_protocols.len() as u8).to_le_bytes());
+                for alpn in &self.requested_protocols {
+                    payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
+                }
 
-                // transport parameters
-                let mut transport_parameters = vec![];
-                self.transport_parameters.write(&mut transport_parameters);
-                self.xoodyak.encrypt_in_place(&mut transport_parameters);
-                handshake.extend_from_slice(&transport_parameters);
-
-                // tag
-                let mut tag = [0; 16];
-                self.xoodyak.squeeze(&mut tag);
-                handshake.extend_from_slice(&tag);
+                self.transport_parameters.write(&mut payload);
+                let i = handshake.len();
+                handshake.resize(i + 16 + payload.len(), 0);
+                self.symmetricstate
+                    .encrypt_and_hash(0, &payload, &mut handshake[i..]);
 
                 // 0-rtt
                 self.state = State::ZeroRtt;
                 None
             }
             (State::ZeroRtt, _) => {
-                let packet = self.next_1rtt_keys0();
+                let (client, server) = self.symmetricstate.split();
+                let kp = match self.side {
+                    Side::Client => KeyPair {
+                        local: client,
+                        remote: server,
+                    },
+                    Side::Server => KeyPair {
+                        local: server,
+                        remote: client,
+                    },
+                };
+                self.next_keys = Some(kp);
                 self.state = State::Handshake;
-                self.zero_rtt_key = Some(packet.local.clone());
                 Some(Keys {
                     header: header_keypair(),
-                    packet: KeyPair {
-                        local: Box::new(packet.local),
-                        remote: Box::new(packet.remote),
-                    },
+                    packet: self.next_1rtt_keys().unwrap(),
                 })
             }
             (State::Handshake, Side::Server) => {
-                // e
-                let mut e = [0; 32];
-                self.xoodyak
-                    .encrypt(self.e.verifying_key().as_bytes(), &mut e);
-                handshake.extend_from_slice(&e);
+                // <- e
+                self.symmetricstate
+                    .mix_hash(self.e.verifying_key().as_bytes());
+                handshake.extend_from_slice(self.e.verifying_key().as_bytes());
 
-                // ee
+                // <- ee
                 let ee = self.e.diffie_hellman(&self.remote_e.unwrap());
-                self.xoodyak.absorb(&ee);
+                self.symmetricstate.mix_key(&ee);
 
-                // se
+                // <- se
                 let se = self.e.diffie_hellman(&self.remote_s.unwrap());
-                self.xoodyak.absorb(&se);
+                self.symmetricstate.mix_key(&se);
 
-                // transport parameters
-                let mut transport_parameters = vec![];
-                self.transport_parameters.write(&mut transport_parameters);
-                self.xoodyak.encrypt_in_place(&mut transport_parameters);
-                handshake.extend_from_slice(&transport_parameters);
+                // payload
+                let mut payload = vec![];
 
-                // tag
-                let mut tag = [0; 16];
-                self.xoodyak.squeeze(&mut tag);
-                handshake.extend_from_slice(&tag);
+                // alpn
+                payload.extend_from_slice(&(self.requested_protocols.len() as u8).to_le_bytes());
+                for alpn in &self.requested_protocols {
+                    payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
+                }
+
+                self.transport_parameters.write(&mut payload);
+                let i = handshake.len();
+                handshake.resize(i + 16 + payload.len(), 0);
+                self.symmetricstate
+                    .encrypt_and_hash(0, &payload, &mut handshake[i..]);
 
                 // 1-rtt keys
+                let (client, server) = self.symmetricstate.split();
+                let kp = match self.side {
+                    Side::Client => KeyPair {
+                        local: client,
+                        remote: server,
+                    },
+                    Side::Server => KeyPair {
+                        local: server,
+                        remote: client,
+                    },
+                };
+                self.next_keys = Some(kp);
                 let packet = self.next_1rtt_keys().unwrap();
                 self.state = State::Data;
                 Some(Keys {
@@ -528,6 +669,18 @@ impl Session for NoiseSession {
                 })
             }
             (State::OneRtt, _) => {
+                let (client, server) = self.symmetricstate.split();
+                let kp = match self.side {
+                    Side::Client => KeyPair {
+                        local: client,
+                        remote: server,
+                    },
+                    Side::Server => KeyPair {
+                        local: server,
+                        remote: client,
+                    },
+                };
+                self.next_keys = Some(kp);
                 let packet = self.next_1rtt_keys().unwrap();
                 self.state = State::Data;
                 Some(Keys {
@@ -556,7 +709,7 @@ impl Session for NoiseSession {
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
-        Some(Box::new(self.alpn.clone()?))
+        Some(Box::new(self.requested_protocols.get(0)?.clone()))
     }
 
     fn export_keying_material(
@@ -565,10 +718,12 @@ impl Session for NoiseSession {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), ExportKeyingMaterialError> {
-        let mut xoodyak = self.xoodyak.clone();
-        xoodyak.absorb(label);
-        xoodyak.absorb(context);
-        xoodyak.squeeze_key(output);
+        blake3::Hasher::new_derive_key("export keying material")
+            .update(context)
+            .update(&self.symmetricstate.ck)
+            .update(label)
+            .finalize_xof()
+            .fill(output);
         Ok(())
     }
 

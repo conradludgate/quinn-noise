@@ -64,7 +64,7 @@ pub async fn connect_client(
     let keypair: SigningKey = SigningKey::generate(&mut csprng);
     let crypto = quinn_noise::NoiseConfig::from(quinn_noise::NoiseClientConfig {
         remote_public_key,
-        alpn: b"bench".to_vec(),
+        requested_protocols: vec![b"bench".to_vec()],
         keypair,
         psk: None,
         keylogger: None,
