@@ -29,14 +29,10 @@ pub fn server_endpoint(
     keypair: ed25519_dalek::SigningKey,
     opt: &Opt,
 ) -> (SocketAddr, quinn::Endpoint) {
-    let crypto = Arc::new(quinn_noise::NoiseConfig::from(
-        quinn_noise::NoiseServerConfig {
-            keypair,
-            keylogger: None,
-            psk: None,
-            supported_protocols: vec![b"bench".to_vec()],
-        },
-    ));
+    let crypto = Arc::new(quinn_noise::NoiseServerConfig {
+        keypair,
+        supported_protocols: vec![b"bench".to_vec()],
+    });
     let mut server_config = quinn::ServerConfig::with_crypto(crypto);
     server_config.transport = Arc::new(transport_config(opt));
 
@@ -62,13 +58,11 @@ pub async fn connect_client(
         quinn::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
     let mut csprng = OsRng {};
     let keypair: SigningKey = SigningKey::generate(&mut csprng);
-    let crypto = quinn_noise::NoiseConfig::from(quinn_noise::NoiseClientConfig {
+    let crypto = quinn_noise::NoiseClientConfig {
         remote_public_key,
         requested_protocols: vec![b"bench".to_vec()],
         keypair,
-        psk: None,
-        keylogger: None,
-    });
+    };
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
     client_config.transport_config(Arc::new(transport_config(&opt)));

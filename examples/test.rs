@@ -79,14 +79,10 @@ async fn client(
 
 /// Creates a server endpoint
 fn server_endpoint(keypair: ed25519_dalek::SigningKey) -> (SocketAddr, quinn::Endpoint) {
-    let crypto = Arc::new(quinn_noise::NoiseConfig::from(
-        quinn_noise::NoiseServerConfig {
-            keypair,
-            keylogger: None,
-            psk: None,
-            supported_protocols: vec![b"test".to_vec()],
-        },
-    ));
+    let crypto = Arc::new(quinn_noise::NoiseServerConfig {
+        keypair,
+        supported_protocols: vec![b"test".to_vec()],
+    });
 
     let server_config = quinn::ServerConfig::with_crypto(crypto);
     let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -103,13 +99,11 @@ pub async fn connect_client(
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let mut csprng = rand::rngs::OsRng {};
     let keypair = ed25519_dalek::SigningKey::generate(&mut csprng);
-    let crypto = quinn_noise::NoiseConfig::from(quinn_noise::NoiseClientConfig {
+    let crypto = quinn_noise::NoiseClientConfig {
         remote_public_key,
         requested_protocols: vec![b"test".to_vec()],
         keypair,
-        psk: None,
-        keylogger: None,
-    });
+    };
 
     let client_config = quinn::ClientConfig::new(Arc::new(crypto));
     let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);

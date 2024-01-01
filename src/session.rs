@@ -1,6 +1,5 @@
 use crate::aead::{header_keypair, ChaCha20PacketKey, PlaintextHeaderKey};
 use crate::dh::DiffieHellman;
-use crate::keylog::KeyLog;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn_proto::crypto::{
     ClientConfig, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey,
@@ -16,92 +15,83 @@ use std::sync::Arc;
 pub struct NoiseClientConfig {
     /// Keypair to use.
     pub keypair: SigningKey,
-    /// Optional private shared key usable as a password for private networks.
-    pub psk: Option<[u8; 32]>,
-    /// Enables keylogging for debugging purposes to the path provided by `SSLKEYLOGFILE`.
-    pub keylogger: Option<Arc<dyn KeyLog>>,
     /// The remote public key. This needs to be set.
     pub remote_public_key: VerifyingKey,
     /// Requested ALPN identifiers.
     pub requested_protocols: Vec<Vec<u8>>,
 }
 
-impl From<NoiseClientConfig> for NoiseConfig {
-    fn from(config: NoiseClientConfig) -> Self {
-        Self {
-            keypair: Some(config.keypair),
-            psk: config.psk,
-            keylogger: config.keylogger,
-            remote_public_key: Some(config.remote_public_key),
-            requested_protocols: config.requested_protocols,
-            supported_protocols: vec![],
-        }
-    }
-}
-
 pub struct NoiseServerConfig {
     /// Keypair to use.
     pub keypair: SigningKey,
-    /// Optional private shared key usable as a password for private networks.
-    pub psk: Option<[u8; 32]>,
-    /// Enables keylogging for debugging purposes to the path provided by `SSLKEYLOGFILE`.
-    pub keylogger: Option<Arc<dyn KeyLog>>,
     /// Supported ALPN identifiers.
     pub supported_protocols: Vec<Vec<u8>>,
 }
 
-impl From<NoiseServerConfig> for NoiseConfig {
-    fn from(config: NoiseServerConfig) -> Self {
-        Self {
-            keypair: Some(config.keypair),
-            psk: config.psk,
-            keylogger: config.keylogger,
-            remote_public_key: None,
-            requested_protocols: vec![],
-            supported_protocols: config.supported_protocols,
-        }
-    }
-}
-
-/// Noise configuration struct.
-#[derive(Default)]
-pub struct NoiseConfig {
-    /// Keypair to use.
-    keypair: Option<SigningKey>,
-    /// Optional private shared key usable as a password for private networks.
-    psk: Option<[u8; 32]>,
-    /// Enables keylogging for debugging purposes to the path provided by `SSLKEYLOGFILE`.
-    keylogger: Option<Arc<dyn KeyLog>>,
-    /// The remote public key. This needs to be set.
-    remote_public_key: Option<VerifyingKey>,
-    /// Requested ALPN identifiers.
-    requested_protocols: Vec<Vec<u8>>,
-    /// Supported ALPN identifiers.
-    supported_protocols: Vec<Vec<u8>>,
-}
-
-impl ClientConfig for NoiseConfig {
+impl ClientConfig for NoiseClientConfig {
     fn start_session(
         self: Arc<Self>,
         _version: u32,
         _server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn Session>, ConnectError> {
-        Ok(Box::new(NoiseConfig::start_session(
-            &self,
-            Side::Client,
-            params,
-        )))
+        let mut rng = rand_core::OsRng {};
+        let s = self.keypair.clone();
+        let e = SigningKey::generate(&mut rng);
+
+        let mut symmetricstate = SymmetricState::initialize_symmetric(PROTOCOL_ID.as_bytes());
+
+        // <- s
+        symmetricstate.mix_hash(self.remote_public_key.as_bytes());
+
+        Ok(Box::new(NoiseSession {
+            symmetricstate,
+            next_keys: None,
+            state: State::Initial,
+            side: Side::Client,
+            e,
+            s,
+            requested_protocols: self.requested_protocols.clone(),
+            supported_protocols: vec![],
+            transport_parameters: *params,
+            remote_transport_parameters: None,
+            remote_e: None,
+            remote_s: Some(self.remote_public_key),
+            zero_rtt_key: None,
+        }))
     }
 }
 
-impl ServerConfig for NoiseConfig {
+impl ServerConfig for NoiseServerConfig {
     fn start_session(
         self: Arc<Self>,
         _version: u32,
         params: &TransportParameters,
     ) -> Box<dyn Session> {
-        Box::new(NoiseConfig::start_session(&self, Side::Server, params))
+        let mut rng = rand_core::OsRng {};
+        let s = self.keypair.clone();
+        let e = SigningKey::generate(&mut rng);
+
+        let mut symmetricstate = SymmetricState::initialize_symmetric(PROTOCOL_ID.as_bytes());
+
+        // <- s
+        symmetricstate.mix_hash(s.verifying_key().as_bytes());
+
+        Box::new(NoiseSession {
+            symmetricstate,
+            next_keys: None,
+            state: State::Initial,
+            side: Side::Server,
+            e,
+            s,
+            requested_protocols: vec![],
+            supported_protocols: self.supported_protocols.clone(),
+            transport_parameters: *params,
+            remote_transport_parameters: None,
+            remote_e: None,
+            remote_s: None,
+            zero_rtt_key: None,
+        })
     }
 
     fn initial_keys(
@@ -136,59 +126,6 @@ impl ServerConfig for NoiseConfig {
         let mut result = [0; 16];
         result.copy_from_slice(tag.as_ref());
         result
-    }
-}
-
-impl NoiseConfig {
-    fn start_session(&self, side: Side, params: &TransportParameters) -> NoiseSession {
-        let mut rng = rand_core::OsRng {};
-        let s = if let Some(keypair) = self.keypair.as_ref() {
-            SigningKey::from_bytes(keypair.as_bytes())
-        } else {
-            SigningKey::generate(&mut rng)
-        };
-        let e = SigningKey::generate(&mut rng);
-
-        let mut symmetricstate = SymmetricState::initialize_symmetric(PROTOCOL_ID.as_bytes());
-
-        // <- s
-        match side {
-            Side::Server => symmetricstate.mix_hash(s.verifying_key().as_bytes()),
-            Side::Client => symmetricstate.mix_hash(self.remote_public_key.unwrap().as_bytes()),
-        }
-
-        NoiseSession {
-            symmetricstate,
-            next_keys: None,
-            state: State::Initial,
-            side,
-            e,
-            s,
-            requested_protocols: self.requested_protocols.clone(),
-            supported_protocols: self.supported_protocols.clone(),
-            transport_parameters: *params,
-            remote_transport_parameters: None,
-            remote_e: None,
-            remote_s: self.remote_public_key,
-            zero_rtt_key: None,
-        }
-    }
-}
-
-impl Clone for NoiseConfig {
-    fn clone(&self) -> Self {
-        let keypair = self
-            .keypair
-            .as_ref()
-            .map(|keypair| SigningKey::from_bytes(keypair.as_bytes()));
-        Self {
-            keypair,
-            psk: self.psk,
-            keylogger: self.keylogger.clone(),
-            remote_public_key: self.remote_public_key,
-            requested_protocols: self.requested_protocols.clone(),
-            supported_protocols: self.supported_protocols.clone(),
-        }
     }
 }
 
@@ -380,7 +317,7 @@ impl Session for NoiseSession {
     }
 
     fn read_handshake(&mut self, handshake: &[u8]) -> Result<bool, TransportError> {
-        tracing::trace!("read_handshake {:?} {:?}", self.state, self.side);
+        println!("read_handshake {:?} {:?}", self.state, self.side);
         match (self.state, self.side) {
             (State::Initial, Side::Server) => {
                 // -> e
@@ -496,7 +433,7 @@ impl Session for NoiseSession {
     }
 
     fn write_handshake(&mut self, handshake: &mut Vec<u8>) -> Option<Keys> {
-        tracing::trace!("write_handshake {:?} {:?}", self.state, self.side);
+        println!("write_handshake {:?} {:?}", self.state, self.side);
         match (self.state, self.side) {
             (State::Initial, Side::Client) => {
                 // -> e
