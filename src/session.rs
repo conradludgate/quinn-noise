@@ -1,4 +1,4 @@
-use crate::aead::{header_keypair, ChaCha20PacketKey, PlaintextHeaderKey};
+use crate::aead::{ChaCha20PacketKey, HeaderProtectionKey};
 use crate::dh::DiffieHellman;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn_proto::crypto::{
@@ -31,7 +31,7 @@ pub struct NoiseServerConfig {
 impl ClientConfig for NoiseClientConfig {
     fn start_session(
         self: Arc<Self>,
-        _version: u32,
+        version: u32,
         _server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn Session>, ConnectError> {
@@ -45,6 +45,7 @@ impl ClientConfig for NoiseClientConfig {
         symmetricstate.mix_hash(self.remote_public_key.as_bytes());
 
         Ok(Box::new(NoiseSession {
+            version,
             symmetricstate,
             next_keys: None,
             state: State::Initial,
@@ -57,15 +58,46 @@ impl ClientConfig for NoiseClientConfig {
             remote_transport_parameters: None,
             remote_e: None,
             remote_s: Some(self.remote_public_key),
-            zero_rtt_key: None,
         }))
+    }
+}
+
+pub(crate) fn initial_keys(version: u32, dst_cid: &ConnectionId, side: Side) -> Keys {
+    let client = blake3::Hasher::new_derive_key("Noise_IK_25519_ChaChaPoly_BLAKE3 initial key")
+        .update(b"client in")
+        .update(dst_cid)
+        .update(&u32::to_le_bytes(version))
+        .finalize()
+        .into();
+
+    let server = blake3::Hasher::new_derive_key("Noise_IK_25519_ChaChaPoly_BLAKE3 initial key")
+        .update(b"server in")
+        .update(dst_cid)
+        .update(&u32::to_le_bytes(version))
+        .finalize()
+        .into();
+
+    let (local, remote) = match side {
+        Side::Client => (client, server),
+        Side::Server => (server, client),
+    };
+
+    Keys {
+        header: KeyPair {
+            local: Box::new(HeaderProtectionKey::new(local)),
+            remote: Box::new(HeaderProtectionKey::new(remote)),
+        },
+        packet: KeyPair {
+            local: Box::new(ChaCha20PacketKey::new(local)),
+            remote: Box::new(ChaCha20PacketKey::new(remote)),
+        },
     }
 }
 
 impl ServerConfig for NoiseServerConfig {
     fn start_session(
         self: Arc<Self>,
-        _version: u32,
+        version: u32,
         params: &TransportParameters,
     ) -> Box<dyn Session> {
         let mut rng = rand_core::OsRng {};
@@ -78,6 +110,7 @@ impl ServerConfig for NoiseServerConfig {
         symmetricstate.mix_hash(s.verifying_key().as_bytes());
 
         Box::new(NoiseSession {
+            version,
             symmetricstate,
             next_keys: None,
             state: State::Initial,
@@ -90,23 +123,16 @@ impl ServerConfig for NoiseServerConfig {
             remote_transport_parameters: None,
             remote_e: None,
             remote_s: None,
-            zero_rtt_key: None,
         })
     }
 
     fn initial_keys(
         &self,
-        _version: u32,
-        _dst_cid: &ConnectionId,
-        _side: Side,
+        version: u32,
+        dst_cid: &ConnectionId,
+        side: Side,
     ) -> Result<Keys, quinn_proto::crypto::UnsupportedVersion> {
-        Ok(Keys {
-            header: header_keypair(),
-            packet: KeyPair {
-                local: Box::new(ChaCha20PacketKey::new([0; 32])),
-                remote: Box::new(ChaCha20PacketKey::new([0; 32])),
-            },
-        })
+        Ok(initial_keys(version, dst_cid, side))
     }
 
     fn retry_tag(&self, _version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
@@ -239,6 +265,7 @@ impl SymmetricState {
 }
 
 pub struct NoiseSession {
+    version: u32,
     symmetricstate: SymmetricState,
     next_keys: Option<KeyPair<[u8; 32]>>,
     state: State,
@@ -251,17 +278,7 @@ pub struct NoiseSession {
     remote_transport_parameters: Option<TransportParameters>,
     remote_e: Option<VerifyingKey>,
     remote_s: Option<VerifyingKey>,
-    zero_rtt_key: Option<ChaCha20PacketKey>,
 }
-
-// impl NoiseSession {
-//     fn conn_id(&self) -> Option<[u8; 32]> {
-//         match self.side {
-//             Side::Client => Some(self.e.verifying_key().to_bytes()),
-//             Side::Server => Some(self.remote_e.as_ref()?.to_bytes()),
-//         }
-//     }
-// }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
@@ -292,15 +309,19 @@ fn split_n<const N: usize>(data: &[u8]) -> Result<(&[u8; N], &[u8]), TransportEr
     Ok((n.try_into().unwrap(), data))
 }
 
-impl Session for NoiseSession {
-    fn initial_keys(&self, _: &ConnectionId, _: Side) -> Keys {
-        Keys {
-            header: header_keypair(),
-            packet: KeyPair {
-                local: Box::new(ChaCha20PacketKey::new([0; 32])),
-                remote: Box::new(ChaCha20PacketKey::new([0; 32])),
-            },
+impl NoiseSession {
+    fn get_header_keys(&self) -> KeyPair<Box<dyn HeaderKey>> {
+        let KeyPair { local, remote } = *self.next_keys.as_ref().unwrap();
+        KeyPair {
+            local: Box::new(HeaderProtectionKey::new(local)),
+            remote: Box::new(HeaderProtectionKey::new(remote)),
         }
+    }
+}
+
+impl Session for NoiseSession {
+    fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
+        initial_keys(self.version, dst_cid, side)
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
@@ -317,7 +338,6 @@ impl Session for NoiseSession {
     }
 
     fn read_handshake(&mut self, handshake: &[u8]) -> Result<bool, TransportError> {
-        println!("read_handshake {:?} {:?}", self.state, self.side);
         match (self.state, self.side) {
             (State::Initial, Side::Server) => {
                 // -> e
@@ -433,7 +453,6 @@ impl Session for NoiseSession {
     }
 
     fn write_handshake(&mut self, handshake: &mut Vec<u8>) -> Option<Keys> {
-        println!("write_handshake {:?} {:?}", self.state, self.side);
         match (self.state, self.side) {
             (State::Initial, Side::Client) => {
                 // -> e
@@ -497,7 +516,7 @@ impl Session for NoiseSession {
                 self.next_keys = Some(kp);
                 self.state = State::Handshake;
                 Some(Keys {
-                    header: header_keypair(),
+                    header: self.get_header_keys(),
                     packet: self.next_1rtt_keys().unwrap(),
                 })
             }
@@ -544,11 +563,10 @@ impl Session for NoiseSession {
                     },
                 };
                 self.next_keys = Some(kp);
-                let packet = self.next_1rtt_keys().unwrap();
                 self.state = State::Data;
                 Some(Keys {
-                    header: header_keypair(),
-                    packet,
+                    header: self.get_header_keys(),
+                    packet: self.next_1rtt_keys().unwrap(),
                 })
             }
             (State::OneRtt, _) => {
@@ -564,11 +582,10 @@ impl Session for NoiseSession {
                     },
                 };
                 self.next_keys = Some(kp);
-                let packet = self.next_1rtt_keys().unwrap();
                 self.state = State::Data;
                 Some(Keys {
-                    header: header_keypair(),
-                    packet,
+                    header: self.get_header_keys(),
+                    packet: self.next_1rtt_keys().unwrap(),
                 })
             }
             _ => None,
@@ -611,10 +628,7 @@ impl Session for NoiseSession {
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> {
-        Some((
-            Box::new(PlaintextHeaderKey),
-            Box::new(self.zero_rtt_key.clone()?),
-        ))
+        None
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
