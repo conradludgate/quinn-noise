@@ -11,7 +11,6 @@ use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErr
 use ring::aead;
 use std::any::Any;
 use std::convert::TryInto;
-use std::io::Cursor;
 use std::sync::Arc;
 
 pub struct NoiseClientConfig {
@@ -154,7 +153,7 @@ impl NoiseConfig {
 
         // <- s
         match side {
-            Side::Server => symmetricstate.mix_hash(s.as_bytes()),
+            Side::Server => symmetricstate.mix_hash(s.verifying_key().as_bytes()),
             Side::Client => symmetricstate.mix_hash(self.remote_public_key.unwrap().as_bytes()),
         }
 
@@ -302,35 +301,6 @@ impl SymmetricState {
     }
 }
 
-// fn kdf(
-//     chaining_key: &[u8],
-//     input_key_material: &[u8],
-//     outputs: usize,
-//     out1: &mut [u8],
-//     out2: &mut [u8],
-//     out3: &mut [u8],) {
-//     // TODO: not actually a hmac, will rename later
-
-//     assert!(key.len() <= 128);
-//     let block_len = 128;
-//     let hash_len = self.hash_len();
-//     let mut ipad = [0x36u8; MAXBLOCKLEN];
-//     let mut opad = [0x5cu8; MAXBLOCKLEN];
-//     for count in 0..key.len() {
-//         ipad[count] ^= key[count];
-//         opad[count] ^= key[count];
-//     }
-//     self.reset();
-//     self.input(&ipad[..block_len]);
-//     self.input(data);
-//     let mut inner_output = [0u8; MAXHASHLEN];
-//     self.result(&mut inner_output);
-//     self.reset();
-//     self.input(&opad[..block_len]);
-//     self.input(&inner_output[..hash_len]);
-//     self.result(out);
-// }
-
 pub struct NoiseSession {
     symmetricstate: SymmetricState,
     next_keys: Option<KeyPair<[u8; 32]>>,
@@ -372,35 +342,6 @@ fn connection_refused(reason: &str) -> TransportError {
         reason: reason.to_string(),
     }
 }
-
-// impl NoiseSession {
-//     fn next_1rtt_keys0(&mut self) -> KeyPair<ChaCha20PacketKey> {
-
-//         if !self.is_handshaking() {
-//             self.xoodyak.ratchet();
-//         }
-//         let mut client = [0; 44];
-//         self.xoodyak.squeeze_key(&mut client);
-//         let mut server = [0; 44];
-//         self.xoodyak.squeeze_key(&mut server);
-//         if let Some(keylogger) = self.keylogger.as_ref() {
-//             keylogger.log("CLIENT_KEY", &self.conn_id().unwrap(), &client[..]);
-//             keylogger.log("SERVER_KEY", &self.conn_id().unwrap(), &server[..]);
-//         }
-//         let client = ChaCha20PacketKey::new(client);
-//         let server = ChaCha20PacketKey::new(server);
-//         match self.side {
-//             Side::Client => KeyPair {
-//                 local: client,
-//                 remote: server,
-//             },
-//             Side::Server => KeyPair {
-//                 local: server,
-//                 remote: client,
-//             },
-//         }
-//     }
-// }
 
 fn split(data: &[u8], n: usize) -> Result<(&[u8], &[u8]), TransportError> {
     if data.len() < n {
@@ -456,30 +397,26 @@ impl Session for NoiseSession {
                 // -> s
                 let (remote_s, rest) = split_n::<48>(rest)?;
                 let mut rs = [0; 32];
-                // self.xoodyak.decrypt(remote_s, &mut s);
                 self.symmetricstate
                     .decrypt_and_hash(0, remote_s, &mut rs)
-                    .map_err(|_| connection_refused("invalid static public key"))?;
+                    .map_err(|_| connection_refused("invalid static public key1"))?;
                 let rs = VerifyingKey::from_bytes(&rs)
-                    .map_err(|_| connection_refused("invalid static public key"))?;
+                    .map_err(|_| connection_refused("invalid static public key2"))?;
                 self.remote_s = Some(rs);
 
                 // -> ss
                 let ss = self.s.diffie_hellman(&rs);
                 self.symmetricstate.mix_key(&ss);
 
-                // // psk
-                // self.xoodyak.absorb(&self.psk);
-
                 // payload
                 let mut payload = vec![0; rest.len() - 16];
                 self.symmetricstate
                     .decrypt_and_hash(0, rest, &mut payload)
-                    .map_err(|_| connection_refused("invalid static public key"))?;
+                    .map_err(|_| connection_refused("invalid static public key3"))?;
 
                 // alpn
-                let (&[len], rest) = split_n(rest)?;
-                let (mut alpns, rest) = split(rest, len as usize)?;
+                let (&[len], rest) = split_n(&payload)?;
+                let (mut alpns, mut transport_params) = split(rest, len as usize)?;
 
                 if !self.supported_protocols.is_empty() {
                     let mut is_supported = false;
@@ -505,7 +442,7 @@ impl Session for NoiseSession {
 
                 self.remote_transport_parameters = Some(TransportParameters::read(
                     Side::Server,
-                    &mut Cursor::new(&rest),
+                    &mut transport_params,
                 )?);
                 self.state = State::ZeroRtt;
                 Ok(!self.requested_protocols.is_empty())
@@ -529,22 +466,23 @@ impl Session for NoiseSession {
                 // payload
                 let mut payload = vec![0; rest.len() - 16];
                 self.symmetricstate
-                    .decrypt_and_hash(1, rest, &mut payload)
-                    .map_err(|_| connection_refused("invalid static public key"))?;
+                    .decrypt_and_hash(0, rest, &mut payload)
+                    .map_err(|_| connection_refused("invalid payload"))?;
 
                 // alpn
-                let (&[len], rest) = split_n(rest)?;
-                let (alpn, rest) = split(rest, len as usize)?;
+                let (&[len], rest) = split_n(&payload)?;
+                let (alpn, mut transport_params) = split(rest, len as usize)?;
                 if !self.requested_protocols.is_empty() {
                     if alpn.is_empty() {
                         return Err(connection_refused("unsupported alpn"));
                     }
                     self.requested_protocols.retain(|a| a == alpn);
+                    self.requested_protocols.truncate(1);
                 }
 
                 self.remote_transport_parameters = Some(TransportParameters::read(
-                    Side::Server,
-                    &mut Cursor::new(&rest),
+                    Side::Client,
+                    &mut transport_params,
                 )?);
                 self.state = State::OneRtt;
                 Ok(!self.requested_protocols.is_empty())
@@ -585,12 +523,19 @@ impl Session for NoiseSession {
                 let mut payload = vec![];
 
                 // alpn
-                payload.extend_from_slice(&(self.requested_protocols.len() as u8).to_le_bytes());
+                let len = self
+                    .requested_protocols
+                    .iter()
+                    .map(|s| s.len() as u8 + 1)
+                    .sum::<u8>();
+                payload.extend_from_slice(&len.to_le_bytes());
                 for alpn in &self.requested_protocols {
                     payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
+                    payload.extend_from_slice(alpn);
                 }
 
                 self.transport_parameters.write(&mut payload);
+
                 let i = handshake.len();
                 handshake.resize(i + 16 + payload.len(), 0);
                 self.symmetricstate
@@ -637,12 +582,13 @@ impl Session for NoiseSession {
                 let mut payload = vec![];
 
                 // alpn
-                payload.extend_from_slice(&(self.requested_protocols.len() as u8).to_le_bytes());
-                for alpn in &self.requested_protocols {
+                if let [alpn] = &*self.requested_protocols {
                     payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
+                    payload.extend_from_slice(alpn);
                 }
 
                 self.transport_parameters.write(&mut payload);
+
                 let i = handshake.len();
                 handshake.resize(i + 16 + payload.len(), 0);
                 self.symmetricstate

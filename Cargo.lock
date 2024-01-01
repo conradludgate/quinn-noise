@@ -674,7 +674,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x25519-dalek",
- "xoodoo",
  "zeroize",
 ]
 
@@ -747,12 +746,6 @@ checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom",
 ]
-
-[[package]]
-name = "rawbytes"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04d0088f16afb86d12c7f239d8de4637fa68ecc99a3db227e1ab58a294713e60"
 
 [[package]]
 name = "redox_syscall"
@@ -1505,16 +1498,6 @@ dependencies = [
  "curve25519-dalek",
  "rand_core",
  "serde",
- "zeroize",
-]
-
-[[package]]
-name = "xoodoo"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1d3c62cbaa9cfdecac0b6aaac5cef3fae1de43c858ac902d6f78b6ee0926107"
-dependencies = [
- "rawbytes",
  "zeroize",
 ]
 
