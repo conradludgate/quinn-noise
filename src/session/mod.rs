@@ -1,5 +1,5 @@
 use noise_protocol::patterns::{HandshakePattern, Token};
-use noise_protocol::Cipher;
+use noise_protocol::{Cipher, HandshakeState, Hash, U8Array, DH};
 use quinn_proto::crypto::{
     ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, Session,
 };
@@ -8,16 +8,24 @@ use quinn_proto::{ConnectionId, Side, TransportError, TransportErrorCode};
 use ring::aead;
 use std::any::Any;
 use std::convert::TryInto;
-use x25519_dalek::PublicKey;
-use zeroize::Zeroizing;
+use std::marker::PhantomData;
 
-use crate::noise_impl::{ChaCha20Poly1305, HandshakeState, Sensitive};
 use crate::HandshakeData;
 
+use self::packet_key::PacketKeyWrapper;
+
 mod client;
+mod packet_key;
 mod server;
 
-fn handshake_pattern() -> HandshakePattern {
+fn handshake_pattern<D: DH, C: Cipher, H: Hash>() -> HandshakePattern {
+    let name = String::leak(format!(
+        "Noise_IK_{}_{}_{}",
+        D::name(),
+        C::name(),
+        H::name()
+    ));
+
     HandshakePattern::new(
         &[],
         &[Token::S],
@@ -25,7 +33,7 @@ fn handshake_pattern() -> HandshakePattern {
             &[Token::E, Token::ES, Token::S, Token::SS],
             &[Token::E, Token::EE, Token::SE],
         ],
-        "Noise_IK_25519_ChaChaPoly_BLAKE3",
+        name,
     )
 }
 
@@ -47,26 +55,39 @@ fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
     }
 }
 
-fn initial_keys() -> Keys {
-    Keys {
-        header: header_keypair(),
-        packet: KeyPair {
-            local: Box::new(Sensitive(Zeroizing::new([0; 32]))),
-            remote: Box::new(Sensitive(Zeroizing::new([0; 32]))),
-        },
+fn packet_keys<C: Cipher + 'static>(keys: KeyPair<C::Key>) -> KeyPair<Box<dyn PacketKey>>
+where
+    C::Key: 'static + Send,
+{
+    KeyPair {
+        local: Box::new(PacketKeyWrapper::<C>(keys.local)),
+        remote: Box::new(PacketKeyWrapper::<C>(keys.remote)),
     }
 }
 
-trait State: 'static + Send + Sync {
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
+fn initial_keys<C: Cipher + 'static>() -> Keys
+where
+    C::Key: 'static + Send,
+{
+    Keys {
+        header: header_keypair(),
+        packet: packet_keys::<C>(KeyPair {
+            local: C::Key::new(),
+            remote: C::Key::new(),
+        }),
+    }
+}
+
+trait State<D: DH, C: Cipher>: 'static + Send + Sync {
+    fn next_1rtt_keys(&mut self) -> Option<KeyPair<C::Key>> {
         None
     }
 
     fn read_handshake(
         self: Box<Self>,
-        _data: &mut CommonData,
+        _data: &mut CommonData<D>,
         _handshake: &[u8],
-    ) -> Result<Box<dyn State>, TransportError> {
+    ) -> Result<Box<dyn State<D, C>>, TransportError> {
         Err(TransportError {
             code: TransportErrorCode::CONNECTION_REFUSED,
             frame: None,
@@ -77,9 +98,9 @@ trait State: 'static + Send + Sync {
     #[allow(clippy::type_complexity)]
     fn write_handshake(
         self: Box<Self>,
-        data: &CommonData,
+        data: &CommonData<D>,
         handshake: &mut Vec<u8>,
-    ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>);
+    ) -> (Box<dyn State<D, C>>, Option<KeyPair<C::Key>>);
 
     fn is_handshaking(&self) -> bool {
         true
@@ -90,7 +111,7 @@ trait State: 'static + Send + Sync {
     }
 }
 
-fn client_server(state: &HandshakeState) -> (Sensitive<[u8; 32]>, Sensitive<[u8; 32]>) {
+fn client_server<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> (C::Key, C::Key) {
     let (client, server) = state.get_ciphers();
     let (client, 0) = client.extract() else {
         panic!("expected nonce to be 0")
@@ -101,16 +122,16 @@ fn client_server(state: &HandshakeState) -> (Sensitive<[u8; 32]>, Sensitive<[u8;
     (client, server)
 }
 
-struct Data {
-    keys: KeyPair<Sensitive<[u8; 32]>>,
-    hash: [u8; 32],
+struct Data<C: Cipher, H: Hash> {
+    keys: KeyPair<C::Key>,
+    hash: H::Output,
 }
 
-impl Data {
-    fn next_keys(&mut self) -> KeyPair<Sensitive<[u8; 32]>> {
+impl<C: Cipher, H: Hash> Data<C, H> {
+    fn next_keys(&mut self) -> KeyPair<C::Key> {
         let KeyPair { local, remote } = &mut self.keys;
-        let next_local = ChaCha20Poly1305::rekey(local);
-        let next_remote = ChaCha20Poly1305::rekey(remote);
+        let next_local = C::rekey(local);
+        let next_remote = C::rekey(remote);
         KeyPair {
             local: std::mem::replace(local, next_local),
             remote: std::mem::replace(remote, next_remote),
@@ -118,20 +139,20 @@ impl Data {
     }
 }
 
-impl State for Data {
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        let keys = self.next_keys();
-        Some(KeyPair {
-            local: Box::new(keys.local),
-            remote: Box::new(keys.remote),
-        })
+impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C> for Data<C, H>
+where
+    C::Key: 'static + Send + Sync,
+    H::Output: 'static + Send + Sync,
+{
+    fn next_1rtt_keys(&mut self) -> Option<KeyPair<C::Key>> {
+        Some(self.next_keys())
     }
 
     fn write_handshake(
         self: Box<Self>,
-        _data: &CommonData,
+        _data: &CommonData<D>,
         _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
+    ) -> (Box<dyn State<D, C>>, Option<KeyPair<C::Key>>) {
         (self, None)
     }
 
@@ -140,21 +161,22 @@ impl State for Data {
     }
 
     fn get_channel_binding(&self) -> &[u8] {
-        &self.hash
+        self.hash.as_slice()
     }
 }
 
-struct NoiseSession {
-    state: Result<Box<dyn State>, TransportError>,
-    data: CommonData,
+struct NoiseSession<D: DH, C: Cipher, H: Hash> {
+    state: Result<Box<dyn State<D, C>>, TransportError>,
+    data: CommonData<D>,
+    hash: PhantomData<H::Output>,
 }
 
-struct CommonData {
+struct CommonData<D: DH> {
     requested_protocols: Vec<Vec<u8>>,
     supported_protocols: Vec<Vec<u8>>,
     transport_parameters: TransportParameters,
     remote_transport_parameters: Option<TransportParameters>,
-    remote_s: Option<PublicKey>,
+    remote_s: Option<D::Pubkey>,
 }
 
 fn connection_refused(reason: &str) -> TransportError {
@@ -193,13 +215,23 @@ fn noise_error(e: noise_protocol::Error) -> TransportError {
     }
 }
 
-impl Session for NoiseSession {
+impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> Session for NoiseSession<D, C, H>
+where
+    D::Pubkey: 'static + Send + Sync,
+    D::Key: 'static + Send + Sync,
+    C::Key: 'static + Send + Sync,
+    H::Output: 'static + Send + Sync,
+{
     fn initial_keys(&self, _dst_cid: &ConnectionId, _side: Side) -> Keys {
-        initial_keys()
+        initial_keys::<C>()
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        self.state.as_mut().unwrap().next_1rtt_keys()
+        self.state
+            .as_mut()
+            .unwrap()
+            .next_1rtt_keys()
+            .map(packet_keys::<C>)
     }
 
     fn read_handshake(&mut self, handshake: &[u8]) -> Result<bool, TransportError> {
@@ -224,10 +256,7 @@ impl Session for NoiseSession {
 
         keys.map(|keys| Keys {
             header: header_keypair(),
-            packet: KeyPair {
-                local: Box::new(keys.local),
-                remote: Box::new(keys.remote),
-            },
+            packet: packet_keys::<C>(keys),
         })
     }
 
@@ -236,7 +265,7 @@ impl Session for NoiseSession {
     }
 
     fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        Some(Box::new(self.data.remote_s?))
+        Some(Box::new(self.data.remote_s.as_ref()?.clone()))
     }
 
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
@@ -259,14 +288,25 @@ impl Session for NoiseSession {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), ExportKeyingMaterialError> {
-        blake3::Hasher::new_derive_key(
-            "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 export keying material",
-        )
-        .update(context)
-        .update(self.state.as_ref().unwrap().get_channel_binding())
-        .update(label)
-        .finalize_xof()
-        .fill(output);
+        if output.is_empty() {
+            return Ok(());
+        }
+        if output.len() > H::hash_len() * 255 {
+            return Err(ExportKeyingMaterialError);
+        }
+
+        let hash = self.state.as_ref().unwrap().get_channel_binding();
+
+        let mut chunks = output.chunks_mut(H::hash_len()).enumerate();
+        let (i, chunk) = chunks.next().unwrap();
+        let mut out = H::hmac_many(hash, &[label, context, &[(i + 1) as u8]]);
+        chunk.copy_from_slice(&out.as_slice()[..chunk.len()]);
+
+        for (i, chunk) in chunks {
+            out = H::hmac_many(hash, &[label, context, out.as_slice(), &[(i + 1) as u8]]);
+            chunk.copy_from_slice(&out.as_slice()[..chunk.len()]);
+        }
+
         Ok(())
     }
 

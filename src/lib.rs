@@ -1,9 +1,8 @@
-mod noise_impl;
 mod session;
 
-use std::sync::Arc;
+use std::{sync::Arc, marker::PhantomData};
 
-pub use x25519_dalek::{PublicKey, StaticSecret};
+use noise_protocol::{DH, Cipher, Hash};
 
 // https://github.com/quicwg/base-drafts/wiki/QUIC-Versions
 // reserved versions for quinn-noise 0xf0f0f2f[0-f]
@@ -14,28 +13,32 @@ pub use x25519_dalek::{PublicKey, StaticSecret};
 pub const SUPPORTED_QUIC_VERSIONS: &[u32] = &[0xf0f0f2f1];
 pub const DEFAULT_QUIC_VERSION: u32 = 0xf0f0f2f1;
 
-pub struct NoiseClientConfig {
+pub struct NoiseClientConfig<D: DH, C: Cipher, H: Hash>  {
     /// Keypair to use.
-    pub keypair: StaticSecret,
+    pub keypair: D::Key,
     /// The remote public key. This needs to be set.
-    pub remote_public_key: PublicKey,
+    pub remote_public_key: D::Pubkey,
     /// Requested ALPN identifiers.
     pub requested_protocols: Vec<Vec<u8>>,
+
+    pub algs: PhantomData<(C::Key, H::Output)>,
 }
 
-pub struct NoiseServerConfig {
+pub struct NoiseServerConfig<D: DH, C: Cipher, H: Hash> {
     /// Keypair to use.
-    pub keypair: StaticSecret,
+    pub keypair: D::Key,
 
     /// Verifier for client static public keys
-    pub remote_public_key_verifier: Arc<dyn PublicKeyVerifier>,
+    pub remote_public_key_verifier: Arc<dyn PublicKeyVerifier<D>>,
 
     /// Supported ALPN identifiers.
     pub supported_protocols: Vec<Vec<u8>>,
+
+    pub algs: PhantomData<(C::Key, H::Output)>,
 }
 
-pub trait PublicKeyVerifier: 'static + Send + Sync {
-    fn verify(&self, key: &PublicKey) -> bool;
+pub trait PublicKeyVerifier<D: DH>: 'static + Send + Sync {
+    fn verify(&self, key: &D::Pubkey) -> bool;
 }
 
 pub struct HandshakeData {

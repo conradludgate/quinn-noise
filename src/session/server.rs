@@ -1,13 +1,11 @@
 use bytemuck::{TransparentWrapper, TransparentWrapperAlloc};
+use noise_protocol::{Cipher, HandshakeState, HandshakeStateBuilder, Hash, U8Array, DH};
 use quinn_proto::crypto::{KeyPair, Keys, ServerConfig, Session};
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectionId, Side, TransportError};
-use std::convert::TryInto;
+use std::marker::PhantomData;
 use std::sync::Arc;
-use x25519_dalek::PublicKey;
-use zeroize::Zeroizing;
 
-use crate::noise_impl::{HandshakeState, HandshakeStateBuilder, Sensitive};
 use crate::{NoiseServerConfig, PublicKeyVerifier};
 
 use super::{
@@ -15,7 +13,7 @@ use super::{
     split_n, CommonData, Data, NoiseSession, State, RETRY_INTEGRITY_KEY, RETRY_INTEGRITY_NONCE,
 };
 
-fn server_keys(state: &HandshakeState) -> KeyPair<Sensitive<[u8; 32]>> {
+fn server_keys<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> KeyPair<C::Key> {
     let (client, server) = client_server(state);
     KeyPair {
         local: server,
@@ -23,21 +21,28 @@ fn server_keys(state: &HandshakeState) -> KeyPair<Sensitive<[u8; 32]>> {
     }
 }
 
-impl ServerConfig for NoiseServerConfig {
+impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> ServerConfig
+    for NoiseServerConfig<D, C, H>
+where
+    D::Pubkey: 'static + Send + Sync,
+    D::Key: 'static + Send + Sync,
+    C::Key: 'static + Send + Sync,
+    H::Output: 'static + Send + Sync,
+{
     fn start_session(
         self: Arc<Self>,
         _version: u32,
         params: &TransportParameters,
     ) -> Box<dyn Session> {
-        let mut state = HandshakeStateBuilder::new();
+        let mut state = HandshakeStateBuilder::<D>::new();
         state
-            .set_pattern(handshake_pattern())
+            .set_pattern(handshake_pattern::<D, C, H>())
             .set_prologue(&[])
-            .set_s(Sensitive(Zeroizing::new(self.keypair.to_bytes())))
+            .set_s(self.keypair.clone())
             .set_is_initiator(false);
-        let state = state.build_handshake_state();
+        let state = state.build_handshake_state::<C, H>();
 
-        Box::new(NoiseSession {
+        Box::new(NoiseSession::<D, C, H> {
             state: Ok(Box::new(ServerInitial {
                 state: InnerState {
                     state,
@@ -51,6 +56,7 @@ impl ServerConfig for NoiseServerConfig {
                 remote_transport_parameters: None,
                 remote_s: None,
             },
+            hash: PhantomData,
         })
     }
 
@@ -60,7 +66,7 @@ impl ServerConfig for NoiseServerConfig {
         _dst_cid: &ConnectionId,
         _side: Side,
     ) -> Result<Keys, quinn_proto::crypto::UnsupportedVersion> {
-        Ok(initial_keys())
+        Ok(initial_keys::<C>())
     }
 
     fn retry_tag(&self, _version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
@@ -83,35 +89,41 @@ impl ServerConfig for NoiseServerConfig {
     }
 }
 
-struct InnerState {
-    state: HandshakeState,
-    remote_public_key_verifier: Arc<dyn PublicKeyVerifier>,
+struct InnerState<D: DH, C: Cipher, H: Hash> {
+    state: HandshakeState<D, C, H>,
+    remote_public_key_verifier: Arc<dyn PublicKeyVerifier<D>>,
 }
 
 #[derive(TransparentWrapper)]
 #[repr(transparent)]
-struct ServerInitial {
-    state: InnerState,
+struct ServerInitial<D: DH, C: Cipher, H: Hash> {
+    state: InnerState<D, C, H>,
 }
 
 #[derive(TransparentWrapper)]
 #[repr(transparent)]
-struct ServerZeroRTT {
-    state: InnerState,
+struct ServerZeroRTT<D: DH, C: Cipher, H: Hash> {
+    state: InnerState<D, C, H>,
 }
 
 #[derive(TransparentWrapper)]
 #[repr(transparent)]
-struct ServerHandshake {
-    state: InnerState,
+struct ServerHandshake<D: DH, C: Cipher, H: Hash> {
+    state: InnerState<D, C, H>,
 }
 
-impl State for ServerInitial {
+impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C> for ServerInitial<D, C, H>
+where
+    D::Pubkey: 'static + Send + Sync,
+    D::Key: 'static + Send + Sync,
+    C::Key: 'static + Send + Sync,
+    H::Output: 'static + Send + Sync,
+{
     fn read_handshake(
         mut self: Box<Self>,
-        data: &mut CommonData,
+        data: &mut CommonData<D>,
         handshake: &[u8],
-    ) -> Result<Box<dyn State>, TransportError> {
+    ) -> Result<Box<dyn State<D, C>>, TransportError> {
         let trailing = self
             .state
             .state
@@ -123,7 +135,6 @@ impl State for ServerInitial {
             .state
             .get_rs()
             .expect("IK pattern has s in the client initial handshake message");
-        let rs = PublicKey::from(rs);
 
         if !self.state.remote_public_key_verifier.verify(&rs) {
             return Err(connection_refused("client not authorized"));
@@ -165,19 +176,25 @@ impl State for ServerInitial {
 
     fn write_handshake(
         self: Box<Self>,
-        _data: &CommonData,
+        _data: &CommonData<D>,
         _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
+    ) -> (Box<dyn State<D, C>>, Option<KeyPair<C::Key>>) {
         (self, None)
     }
 }
 
-impl State for ServerZeroRTT {
+impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C> for ServerZeroRTT<D, C, H>
+where
+    D::Pubkey: 'static + Send + Sync,
+    D::Key: 'static + Send + Sync,
+    C::Key: 'static + Send + Sync,
+    H::Output: 'static + Send + Sync,
+{
     fn write_handshake(
         self: Box<Self>,
-        _data: &CommonData,
+        _data: &CommonData<D>,
         _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
+    ) -> (Box<dyn State<D, C>>, Option<KeyPair<C::Key>>) {
         let keys = server_keys(&self.state.state);
 
         (
@@ -187,12 +204,19 @@ impl State for ServerZeroRTT {
     }
 }
 
-impl State for ServerHandshake {
+impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C>
+    for ServerHandshake<D, C, H>
+where
+    D::Pubkey: 'static + Send + Sync,
+    D::Key: 'static + Send + Sync,
+    C::Key: 'static + Send + Sync,
+    H::Output: 'static + Send + Sync,
+{
     fn write_handshake(
         mut self: Box<Self>,
-        data: &CommonData,
+        data: &CommonData<D>,
         handshake: &mut Vec<u8>,
-    ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
+    ) -> (Box<dyn State<D, C>>, Option<KeyPair<C::Key>>) {
         // payload
         let mut payload = vec![];
 
@@ -208,8 +232,8 @@ impl State for ServerHandshake {
         handshake.resize(overhead + payload.len(), 0);
         self.state.state.write_message(&payload, handshake).unwrap();
 
-        let mut data = Data {
-            hash: self.state.state.get_hash().try_into().unwrap(),
+        let mut data = Data::<C, H> {
+            hash: H::Output::from_slice(self.state.state.get_hash()),
             keys: server_keys(&self.state.state),
         };
 

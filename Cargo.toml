@@ -8,20 +8,20 @@ repository = "https://github.com/conradludgate/quinn-noise"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-blake3 = "1.5.0"
 bytemuck = { version = "1.14.0", features = ["derive", "extern_crate_std"] }
 bytes = "1.5.0"
 noise-protocol = "0.2.0"
 quinn-proto = { version = "0.10.6", default-features = false }
-rand_core = "0.6.4"
 ring = "0.17.7"
-subtle = "2.4.0"
-x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }
-zeroize = "1.7.0"
 
 [dev-dependencies]
 anyhow = "1"
-hdrhistogram = { version = "7.2", default-features = false }
-quinn = "0.10"
 clap = { version = "4", features = ["derive"] }
+hdrhistogram = { version = "7.2", default-features = false }
+noise-ring = "0.2.0"
+noise-rust-crypto = "0.6.2"
+quinn = "0.10"
+rand_core = "0.6.4"
 tokio = { version = "1", features = ["full"] }
+x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }
+zeroize = "1.7.0"
