@@ -9,15 +9,15 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 blake3 = "1.5.0"
+bytemuck = { version = "1.14.0", features = ["derive", "extern_crate_std"] }
 bytes = "1.5.0"
-quinn-proto = { version = "0.10.6", default-features = false, features = ["ring"] }
+noise-protocol = "0.2.0"
+quinn-proto = { version = "0.10.6", default-features = false }
 rand_core = "0.6.4"
 ring = "0.17.7"
 subtle = "2.4.0"
-tracing = "0.1.26"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }
 zeroize = "1.7.0"
-noise-protocol = "0.2.0"
 
 [dev-dependencies]
 anyhow = "1"
@@ -25,5 +25,3 @@ hdrhistogram = { version = "7.2", default-features = false }
 quinn = "0.10"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
-tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
-rand = "0.8"

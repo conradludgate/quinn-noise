@@ -1,3 +1,4 @@
+use bytemuck::{TransparentWrapper, TransparentWrapperAlloc};
 use quinn_proto::crypto::{KeyPair, Keys, ServerConfig, Session};
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectionId, Side, TransportError};
@@ -6,7 +7,7 @@ use std::sync::Arc;
 use x25519_dalek::PublicKey;
 use zeroize::Zeroizing;
 
-use crate::noise_impl::{HandshakeState, Sensitive};
+use crate::noise_impl::{HandshakeState, HandshakeStateBuilder, Sensitive};
 use crate::NoiseServerConfig;
 
 use super::{
@@ -28,20 +29,16 @@ impl ServerConfig for NoiseServerConfig {
         _version: u32,
         params: &TransportParameters,
     ) -> Box<dyn Session> {
-        let handshake_state = HandshakeState::new(
-            handshake_pattern(),
-            false,
-            [],
-            Some(Sensitive(Zeroizing::new(self.keypair.to_bytes()))),
-            None,
-            None,
-            None,
-        );
+        let mut state = HandshakeStateBuilder::new();
+        state
+            .set_pattern(handshake_pattern())
+            .set_prologue(&[])
+            .set_s(Sensitive(Zeroizing::new(self.keypair.to_bytes())))
+            .set_is_initiator(false);
+        let state = state.build_handshake_state();
 
         Box::new(NoiseSession {
-            state: Ok(Box::new(ServerInitial {
-                state: handshake_state,
-            })),
+            state: Ok(Box::new(ServerInitial { state })),
             data: CommonData {
                 requested_protocols: vec![],
                 supported_protocols: self.supported_protocols.clone(),
@@ -81,14 +78,20 @@ impl ServerConfig for NoiseServerConfig {
     }
 }
 
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
 struct ServerInitial {
     state: HandshakeState,
 }
 
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
 struct ServerZeroRTT {
     state: HandshakeState,
 }
 
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
 struct ServerHandshake {
     state: HandshakeState,
 }
@@ -135,7 +138,7 @@ impl State for ServerInitial {
             &mut transport_params,
         )?);
 
-        Ok(Box::new(ServerZeroRTT { state: self.state }))
+        Ok(ServerZeroRTT::wrap_box(ServerInitial::peel_box(self)))
     }
 
     fn write_handshake(
@@ -154,7 +157,11 @@ impl State for ServerZeroRTT {
         _handshake: &mut Vec<u8>,
     ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
         let keys = server_keys(&self.state);
-        (Box::new(ServerHandshake { state: self.state }), Some(keys))
+
+        (
+            ServerHandshake::wrap_box(ServerZeroRTT::peel_box(self)),
+            Some(keys),
+        )
     }
 }
 

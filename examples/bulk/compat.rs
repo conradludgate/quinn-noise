@@ -9,19 +9,9 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use tokio::runtime::{Builder, Runtime};
-use tracing::trace;
 use x25519_dalek::StaticSecret;
-
-pub fn configure_tracing_subscriber() {
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .finish(),
-    )
-    .unwrap();
-}
 
 /// Creates a server endpoint which runs on the given runtime
 pub fn server_endpoint(
@@ -71,7 +61,6 @@ pub async fn connect_client(
         .unwrap()
         .await
         .context("unable to connect")?;
-    trace!("connected");
 
     Ok((endpoint, connection))
 }

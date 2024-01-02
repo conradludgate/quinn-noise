@@ -9,6 +9,7 @@ pub(crate) use cipher::ChaCha20Poly1305;
 
 pub type HandshakeState =
     noise_protocol::HandshakeState<dh::X25519, ChaCha20Poly1305, hash::Blake3>;
+pub type HandshakeStateBuilder<'a> = noise_protocol::HandshakeStateBuilder<'a, dh::X25519>;
 
 /// Struct holding a value that is safely zeroed on drop.
 pub struct Sensitive<A: U8Array + Zeroize>(pub Zeroizing<A>);

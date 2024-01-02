@@ -1,3 +1,5 @@
+use bytemuck::{TransparentWrapper, TransparentWrapperAlloc};
+use noise_protocol::HandshakeStateBuilder;
 use quinn_proto::crypto::{ClientConfig, KeyPair, PacketKey, Session};
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, Side, TransportError};
@@ -28,20 +30,17 @@ impl ClientConfig for NoiseClientConfig {
         _server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn Session>, ConnectError> {
-        let handshake_state = HandshakeState::new(
-            handshake_pattern(),
-            true,
-            [],
-            Some(Sensitive(Zeroizing::new(self.keypair.to_bytes()))),
-            None,
-            Some(self.remote_public_key.to_bytes()),
-            None,
-        );
+        let mut state = HandshakeStateBuilder::new();
+        state
+            .set_pattern(handshake_pattern())
+            .set_prologue(&[])
+            .set_s(Sensitive(Zeroizing::new(self.keypair.to_bytes())))
+            .set_rs(self.remote_public_key.to_bytes())
+            .set_is_initiator(true);
+        let state = state.build_handshake_state();
 
         Ok(Box::new(NoiseSession {
-            state: Ok(Box::new(ClientInitial {
-                state: handshake_state,
-            })),
+            state: Ok(Box::new(ClientInitial { state })),
             data: CommonData {
                 requested_protocols: self.requested_protocols.clone(),
                 supported_protocols: vec![],
@@ -53,21 +52,22 @@ impl ClientConfig for NoiseClientConfig {
     }
 }
 
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
 struct ClientInitial {
     state: HandshakeState,
 }
 
-struct ClientZeroRTT {
-    state: HandshakeState,
-}
-
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
 struct ClientHandshake {
     state: HandshakeState,
 }
 
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
 struct ClientOneRTT {
-    keys: KeyPair<Sensitive<[u8; 32]>>,
-    hash: [u8; 32],
+    data: Data,
 }
 
 impl State for ClientInitial {
@@ -97,18 +97,11 @@ impl State for ClientInitial {
         handshake.resize(overhead + payload.len(), 0);
         self.state.write_message(&payload, handshake).unwrap();
 
-        (Box::new(ClientZeroRTT { state: self.state }), None)
-    }
-}
-
-impl State for ClientZeroRTT {
-    fn write_handshake(
-        self: Box<Self>,
-        _data: &CommonData,
-        _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
         let keys = client_keys(&self.state);
-        (Box::new(ClientHandshake { state: self.state }), Some(keys))
+        (
+            ClientHandshake::wrap_box(ClientInitial::peel_box(self)),
+            Some(keys),
+        )
     }
 }
 
@@ -143,8 +136,10 @@ impl State for ClientHandshake {
         )?);
 
         Ok(Box::new(ClientOneRTT {
-            hash: self.state.get_hash().try_into().unwrap(),
-            keys: client_keys(&self.state),
+            data: Data {
+                hash: self.state.get_hash().try_into().unwrap(),
+                keys: client_keys(&self.state),
+            },
         }))
     }
 
@@ -159,20 +154,11 @@ impl State for ClientHandshake {
 
 impl State for ClientOneRTT {
     fn write_handshake(
-        self: Box<Self>,
+        mut self: Box<Self>,
         _data: &CommonData,
         _handshake: &mut Vec<u8>,
     ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        let mut data = Data {
-            hash: self.hash,
-            keys: self.keys,
-        };
-
-        let keys = data.next_keys();
-        (Box::new(data), Some(keys))
-    }
-
-    fn get_channel_binding(&self) -> &[u8] {
-        &self.hash
+        let keys = self.data.next_keys();
+        (ClientOneRTT::peel_box(self), Some(keys))
     }
 }

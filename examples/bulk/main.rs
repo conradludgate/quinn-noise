@@ -8,20 +8,15 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rand_core::OsRng;
 use tokio::sync::Semaphore;
-use tracing::{info, trace};
 
 mod compat;
 mod stats;
 
-use compat::{
-    configure_tracing_subscriber, connect_client, drain_stream, rt, send_data_on_stream,
-    server_endpoint, Opt,
-};
+use compat::{connect_client, drain_stream, rt, send_data_on_stream, server_endpoint, Opt};
 use stats::{Stats, TransferResult};
 
 fn main() {
     let opt = Opt::parse();
-    configure_tracing_subscriber();
 
     let keypair = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let public_key = x25519_dalek::PublicKey::from(&keypair);
@@ -78,7 +73,6 @@ async fn server(endpoint: quinn::Endpoint, opt: Opt) -> Result<()> {
                     }
                     Ok(stream) => stream,
                 };
-                trace!("stream established");
 
                 tokio::spawn(
                     async move { drain_stream(&mut recv_stream, opt.read_unordered).await },
@@ -128,7 +122,6 @@ async fn client(
         tokio::spawn(async move {
             let result =
                 handle_client_stream(connection, opt.upload_size, opt.read_unordered).await;
-            info!("stream finished: {:?}", result);
             results.lock().unwrap().push(result);
             drop(permit);
         });
