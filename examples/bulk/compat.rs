@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use quinn_noise::PublicKeyVerifier;
+use noise_protocol_quinn::PublicKeyVerifier;
 use rand_core::OsRng;
 use tokio::runtime::{Builder, Runtime};
 use x25519_dalek::StaticSecret;
@@ -27,7 +27,7 @@ pub fn server_endpoint(
     keypair: StaticSecret,
     opt: &Opt,
 ) -> (SocketAddr, quinn::Endpoint) {
-    let crypto = Arc::new(quinn_noise::NoiseServerConfig {
+    let crypto = Arc::new(noise_protocol_quinn::NoiseServerConfig {
         keypair,
         supported_protocols: vec![b"bench".to_vec()],
         remote_public_key_verifier: Arc::new(NoVerify),
@@ -56,7 +56,7 @@ pub async fn connect_client(
     let endpoint =
         quinn::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
     let keypair = StaticSecret::random_from_rng(OsRng);
-    let crypto = quinn_noise::NoiseClientConfig {
+    let crypto = noise_protocol_quinn::NoiseClientConfig {
         remote_public_key,
         requested_protocols: vec![b"bench".to_vec()],
         keypair,

@@ -1,10 +1,10 @@
 [package]
-name = "quinn-noise"
-version = "0.4.0"
-authors = ["David Craven <david@craven.ch>"]
+name = "noise-protocol-quinn"
+version = "0.1.0"
+authors = ["Conrad Ludgate <conradludgate@gmail.com>"]
 edition = "2021"
-description = "quinn noise implementation."
-repository = "https://github.com/ipfs-rust/quinn-noise"
+description = "Noise_IK_25519_ChaChaPoly_BLAKE3 QUIC encryption impl for quinn"
+repository = "https://github.com/conradludgate/quinn-noise"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

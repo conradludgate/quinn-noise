@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{ensure, Context, Result};
-use quinn_noise::{HandshakeData, PublicKeyVerifier};
+use noise_protocol_quinn::{HandshakeData, PublicKeyVerifier};
 use rand_core::OsRng;
 use x25519_dalek::PublicKey;
 
@@ -99,7 +99,7 @@ fn server_endpoint(
     keypair: x25519_dalek::StaticSecret,
     remote_public_key: x25519_dalek::PublicKey,
 ) -> (SocketAddr, quinn::Endpoint) {
-    let crypto = Arc::new(quinn_noise::NoiseServerConfig {
+    let crypto = Arc::new(noise_protocol_quinn::NoiseServerConfig {
         keypair,
         supported_protocols: vec![b"test1".to_vec(), b"test2".to_vec()],
         remote_public_key_verifier: Arc::new(Verifier([remote_public_key].into_iter().collect())),
@@ -119,7 +119,7 @@ pub async fn connect_client(
     keypair: x25519_dalek::StaticSecret,
     remote_public_key: x25519_dalek::PublicKey,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    let crypto = quinn_noise::NoiseClientConfig {
+    let crypto = noise_protocol_quinn::NoiseClientConfig {
         remote_public_key,
         requested_protocols: vec![b"test3".to_vec(), b"test1".to_vec(), b"test2".to_vec()],
         keypair,
