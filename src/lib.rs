@@ -1,5 +1,4 @@
 mod aead;
-mod dh;
 mod session;
 
 pub use crate::session::{NoiseClientConfig, NoiseServerConfig};

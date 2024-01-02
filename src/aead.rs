@@ -13,11 +13,16 @@ pub struct ChaCha20PacketKey {
 impl ChaCha20PacketKey {
     pub fn new(key: [u8; 32]) -> Self {
         let mut iv = [0; 12];
-        blake3::Hasher::new_derive_key("quic-noise iv")
-            .update(&key)
-            .finalize_xof()
-            .fill(&mut iv);
-        let key = blake3::derive_key("quic-noise key", &key);
+        blake3::Hasher::new_derive_key(
+            "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 packet iv",
+        )
+        .update(&key)
+        .finalize_xof()
+        .fill(&mut iv);
+        let key = blake3::derive_key(
+            "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 packet key",
+            &key,
+        );
         Self {
             key: aead::LessSafeKey::new(
                 aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).unwrap(),
@@ -149,7 +154,10 @@ pub struct HeaderProtectionKey(aead::quic::HeaderProtectionKey);
 
 impl HeaderProtectionKey {
     pub fn new(ikm: [u8; 32]) -> Self {
-        let key = blake3::derive_key("Noise_IK_25519_ChaChaPoly_BLAKE3 header key", &ikm);
+        let key = blake3::derive_key(
+            "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 header key",
+            &ikm,
+        );
         Self(aead::quic::HeaderProtectionKey::new(&aead::quic::CHACHA20, &key).unwrap())
     }
 

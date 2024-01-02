@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rand_core::OsRng;
 use tokio::sync::Semaphore;
 use tracing::{info, trace};
 
@@ -22,9 +23,8 @@ fn main() {
     let opt = Opt::parse();
     configure_tracing_subscriber();
 
-    let mut csprng = rand::rngs::OsRng {};
-    let keypair = ed25519_dalek::SigningKey::generate(&mut csprng);
-    let public_key = keypair.verifying_key();
+    let keypair = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+    let public_key = x25519_dalek::PublicKey::from(&keypair);
 
     let runtime = rt();
     let (server_addr, endpoint) = server_endpoint(&runtime, keypair, &opt);
@@ -107,7 +107,7 @@ async fn server(endpoint: quinn::Endpoint, opt: Opt) -> Result<()> {
 
 async fn client(
     server_addr: SocketAddr,
-    remote_public_key: ed25519_dalek::VerifyingKey,
+    remote_public_key: x25519_dalek::PublicKey,
     opt: Opt,
 ) -> Result<ClientStats> {
     let (endpoint, connection) = connect_client(server_addr, remote_public_key, opt).await?;

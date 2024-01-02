@@ -1,29 +1,29 @@
 use crate::aead::{ChaCha20PacketKey, HeaderProtectionKey};
-use crate::dh::DiffieHellman;
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn_proto::crypto::{
     ClientConfig, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey,
     ServerConfig, Session,
 };
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
+use rand_core::OsRng;
 use ring::aead;
 use std::any::Any;
 use std::convert::TryInto;
 use std::sync::Arc;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct NoiseClientConfig {
     /// Keypair to use.
-    pub keypair: SigningKey,
+    pub keypair: StaticSecret,
     /// The remote public key. This needs to be set.
-    pub remote_public_key: VerifyingKey,
+    pub remote_public_key: PublicKey,
     /// Requested ALPN identifiers.
     pub requested_protocols: Vec<Vec<u8>>,
 }
 
 pub struct NoiseServerConfig {
     /// Keypair to use.
-    pub keypair: SigningKey,
+    pub keypair: StaticSecret,
     /// Supported ALPN identifiers.
     pub supported_protocols: Vec<Vec<u8>>,
 }
@@ -35,9 +35,8 @@ impl ClientConfig for NoiseClientConfig {
         _server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn Session>, ConnectError> {
-        let mut rng = rand_core::OsRng {};
         let s = self.keypair.clone();
-        let e = SigningKey::generate(&mut rng);
+        let e = StaticSecret::random_from_rng(OsRng);
 
         let mut symmetricstate = SymmetricState::initialize_symmetric(PROTOCOL_ID.as_bytes());
 
@@ -100,14 +99,13 @@ impl ServerConfig for NoiseServerConfig {
         version: u32,
         params: &TransportParameters,
     ) -> Box<dyn Session> {
-        let mut rng = rand_core::OsRng {};
         let s = self.keypair.clone();
-        let e = SigningKey::generate(&mut rng);
+        let e = StaticSecret::random_from_rng(OsRng);
 
         let mut symmetricstate = SymmetricState::initialize_symmetric(PROTOCOL_ID.as_bytes());
 
         // <- s
-        symmetricstate.mix_hash(s.verifying_key().as_bytes());
+        symmetricstate.mix_hash(PublicKey::from(&s).as_bytes());
 
         Box::new(NoiseSession {
             version,
@@ -180,10 +178,12 @@ impl SymmetricState {
         // Sets ck, temp_k = HKDF(ck, input_key_material, 2).
         // If HASHLEN is 64, then truncates temp_k to 32 bytes.
         // Calls InitializeKey(temp_k).
-        let mut bytes = blake3::Hasher::new_derive_key(PROTOCOL_ID)
-            .update(&self.ck)
-            .update(input_key_material)
-            .finalize_xof();
+        let mut bytes = blake3::Hasher::new_derive_key(
+            "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 mix key",
+        )
+        .update(&self.ck)
+        .update(input_key_material)
+        .finalize_xof();
         bytes.fill(&mut self.ck);
         let mut cipher = [0; 32];
         bytes.fill(&mut cipher);
@@ -251,9 +251,11 @@ impl SymmetricState {
     }
 
     pub fn split(&mut self) -> ([u8; 32], [u8; 32]) {
-        let mut bytes = blake3::Hasher::new_derive_key(PROTOCOL_ID)
-            .update(&self.ck)
-            .finalize_xof();
+        let mut bytes = blake3::Hasher::new_derive_key(
+            "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 split key",
+        )
+        .update(&self.ck)
+        .finalize_xof();
 
         let mut temp_k1 = [0; 32];
         let mut temp_k2 = [0; 32];
@@ -270,14 +272,14 @@ pub struct NoiseSession {
     next_keys: Option<KeyPair<[u8; 32]>>,
     state: State,
     side: Side,
-    e: SigningKey,
-    s: SigningKey,
+    e: StaticSecret,
+    s: StaticSecret,
     requested_protocols: Vec<Vec<u8>>,
     supported_protocols: Vec<Vec<u8>>,
     transport_parameters: TransportParameters,
     remote_transport_parameters: Option<TransportParameters>,
-    remote_e: Option<VerifyingKey>,
-    remote_s: Option<VerifyingKey>,
+    remote_e: Option<PublicKey>,
+    remote_s: Option<PublicKey>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -327,8 +329,14 @@ impl Session for NoiseSession {
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
         let KeyPair { local, remote } = *self.next_keys.as_ref()?;
         self.next_keys = Some(KeyPair {
-            local: blake3::derive_key("update key", &local),
-            remote: blake3::derive_key("update key", &remote),
+            local: blake3::derive_key(
+                "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 update key",
+                &local,
+            ),
+            remote: blake3::derive_key(
+                "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 update key",
+                &remote,
+            ),
         });
 
         Some(KeyPair {
@@ -343,13 +351,12 @@ impl Session for NoiseSession {
                 // -> e
                 let (re, rest) = split_n(handshake)?;
                 self.symmetricstate.mix_hash(re);
-                let re = VerifyingKey::from_bytes(re)
-                    .map_err(|_| connection_refused("invalid ephemeral public key"))?;
+                let re = PublicKey::from(*re);
                 self.remote_e = Some(re);
 
                 // -> es
                 let es = self.s.diffie_hellman(&re);
-                self.symmetricstate.mix_key(&es);
+                self.symmetricstate.mix_key(es.as_bytes());
 
                 // -> s
                 let (remote_s, rest) = split_n::<48>(rest)?;
@@ -357,13 +364,12 @@ impl Session for NoiseSession {
                 self.symmetricstate
                     .decrypt_and_hash(0, remote_s, &mut rs)
                     .map_err(|_| connection_refused("invalid static public key1"))?;
-                let rs = VerifyingKey::from_bytes(&rs)
-                    .map_err(|_| connection_refused("invalid static public key2"))?;
+                let rs = PublicKey::from(rs);
                 self.remote_s = Some(rs);
 
                 // -> ss
                 let ss = self.s.diffie_hellman(&rs);
-                self.symmetricstate.mix_key(&ss);
+                self.symmetricstate.mix_key(ss.as_bytes());
 
                 // payload
                 let mut payload = vec![0; rest.len() - 16];
@@ -408,17 +414,16 @@ impl Session for NoiseSession {
                 // <- e
                 let (re, rest) = split_n::<32>(handshake)?;
                 self.symmetricstate.mix_hash(re);
-                let re = VerifyingKey::from_bytes(re)
-                    .map_err(|_| connection_refused("invalid ephemeral public key"))?;
+                let re = PublicKey::from(*re);
                 self.remote_e = Some(re);
 
                 // <- ee
                 let ee = self.e.diffie_hellman(&re);
-                self.symmetricstate.mix_key(&ee);
+                self.symmetricstate.mix_key(ee.as_bytes());
 
                 // <- se
                 let se = self.s.diffie_hellman(&re);
-                self.symmetricstate.mix_key(&se);
+                self.symmetricstate.mix_key(se.as_bytes());
 
                 // payload
                 let mut payload = vec![0; rest.len() - 16];
@@ -457,23 +462,26 @@ impl Session for NoiseSession {
             (State::Initial, Side::Client) => {
                 // -> e
                 self.symmetricstate
-                    .mix_hash(self.e.verifying_key().as_bytes());
-                handshake.extend_from_slice(self.e.verifying_key().as_bytes());
+                    .mix_hash(PublicKey::from(&self.e).as_bytes());
+                handshake.extend_from_slice(PublicKey::from(&self.e).as_bytes());
 
                 // -> es
                 let es = self.e.diffie_hellman(&self.remote_s.unwrap());
-                self.symmetricstate.mix_key(&es);
+                self.symmetricstate.mix_key(es.as_bytes());
 
                 // -> s
                 let mut s = [0; 48];
-                self.symmetricstate
-                    .encrypt_and_hash(0, self.s.verifying_key().as_bytes(), &mut s);
+                self.symmetricstate.encrypt_and_hash(
+                    0,
+                    PublicKey::from(&self.s).as_bytes(),
+                    &mut s,
+                );
                 handshake.extend_from_slice(&s);
 
                 // -> ss
                 let s = self.remote_s.unwrap();
                 let ss = self.s.diffie_hellman(&s);
-                self.symmetricstate.mix_key(&ss);
+                self.symmetricstate.mix_key(ss.as_bytes());
 
                 // payload
                 let mut payload = vec![];
@@ -523,16 +531,16 @@ impl Session for NoiseSession {
             (State::Handshake, Side::Server) => {
                 // <- e
                 self.symmetricstate
-                    .mix_hash(self.e.verifying_key().as_bytes());
-                handshake.extend_from_slice(self.e.verifying_key().as_bytes());
+                    .mix_hash(PublicKey::from(&self.e).as_bytes());
+                handshake.extend_from_slice(PublicKey::from(&self.e).as_bytes());
 
                 // <- ee
                 let ee = self.e.diffie_hellman(&self.remote_e.unwrap());
-                self.symmetricstate.mix_key(&ee);
+                self.symmetricstate.mix_key(ee.as_bytes());
 
                 // <- se
                 let se = self.e.diffie_hellman(&self.remote_s.unwrap());
-                self.symmetricstate.mix_key(&se);
+                self.symmetricstate.mix_key(se.as_bytes());
 
                 // payload
                 let mut payload = vec![];
@@ -618,12 +626,14 @@ impl Session for NoiseSession {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), ExportKeyingMaterialError> {
-        blake3::Hasher::new_derive_key("export keying material")
-            .update(context)
-            .update(&self.symmetricstate.ck)
-            .update(label)
-            .finalize_xof()
-            .fill(output);
+        blake3::Hasher::new_derive_key(
+            "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 export keying material",
+        )
+        .update(context)
+        .update(&self.symmetricstate.ck)
+        .update(label)
+        .finalize_xof()
+        .fill(output);
         Ok(())
     }
 

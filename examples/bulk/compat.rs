@@ -9,10 +9,10 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use tokio::runtime::{Builder, Runtime};
 use tracing::trace;
+use x25519_dalek::StaticSecret;
 
 pub fn configure_tracing_subscriber() {
     tracing::subscriber::set_global_default(
@@ -26,7 +26,7 @@ pub fn configure_tracing_subscriber() {
 /// Creates a server endpoint which runs on the given runtime
 pub fn server_endpoint(
     rt: &tokio::runtime::Runtime,
-    keypair: ed25519_dalek::SigningKey,
+    keypair: StaticSecret,
     opt: &Opt,
 ) -> (SocketAddr, quinn::Endpoint) {
     let crypto = Arc::new(quinn_noise::NoiseServerConfig {
@@ -51,13 +51,12 @@ pub fn server_endpoint(
 /// Create a client endpoint and client connection
 pub async fn connect_client(
     server_addr: SocketAddr,
-    remote_public_key: ed25519_dalek::VerifyingKey,
+    remote_public_key: x25519_dalek::PublicKey,
     opt: Opt,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let endpoint =
         quinn::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
-    let mut csprng = OsRng {};
-    let keypair: SigningKey = SigningKey::generate(&mut csprng);
+    let keypair = StaticSecret::random_from_rng(OsRng);
     let crypto = quinn_noise::NoiseClientConfig {
         remote_public_key,
         requested_protocols: vec![b"bench".to_vec()],
