@@ -10,12 +10,9 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 blake3 = "1.5.0"
 bytes = "1.5.0"
-curve25519-dalek = "4.1.0"
-ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
 quinn-proto = { version = "0.10.6", default-features = false, features = ["ring"] }
 rand_core = "0.6.4"
 ring = "0.17.7"
-sha2 = "0.10.8"
 subtle = "2.4.0"
 tracing = "0.1.26"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets"] }

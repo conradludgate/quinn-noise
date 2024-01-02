@@ -1,16 +1,18 @@
-use crate::aead::{ChaCha20PacketKey, HeaderProtectionKey};
+use crate::aead::{header_keypair, Blake3, ChaCha20Poly1305, Sensitive, X25519};
+use noise_protocol::patterns::{HandshakePattern, Token};
+use noise_protocol::{Cipher, HandshakeState};
 use quinn_proto::crypto::{
-    ClientConfig, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey,
-    ServerConfig, Session,
+    ClientConfig, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, ServerConfig,
+    Session,
 };
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
-use rand_core::OsRng;
 use ring::aead;
 use std::any::Any;
 use std::convert::TryInto;
 use std::sync::Arc;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 pub struct NoiseClientConfig {
     /// Keypair to use.
@@ -31,64 +33,55 @@ pub struct NoiseServerConfig {
 impl ClientConfig for NoiseClientConfig {
     fn start_session(
         self: Arc<Self>,
-        version: u32,
+        _version: u32,
         _server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn Session>, ConnectError> {
-        let s = self.keypair.clone();
-        let e = StaticSecret::random_from_rng(OsRng);
+        let pattern = HandshakePattern::new(
+            &[],
+            &[Token::S],
+            &[
+                &[Token::E, Token::ES, Token::S, Token::SS],
+                &[Token::E, Token::EE, Token::SE],
+            ],
+            "Noise_IK_25519_ChaChaPoly_BLAKE3",
+        );
 
-        let mut symmetricstate = SymmetricState::initialize_symmetric(PROTOCOL_ID.as_bytes());
+        let handshake_state = HandshakeState::<X25519, ChaCha20Poly1305, Blake3>::new(
+            pattern,
+            true,
+            [],
+            Some(Sensitive(Zeroizing::new(self.keypair.to_bytes()))),
+            None,
+            Some(self.remote_public_key.to_bytes()),
+            None,
+        );
+
+        // let mut symmetricstate = SymmetricState::initialize_symmetric(PROTOCOL_ID.as_bytes());
 
         // <- s
-        symmetricstate.mix_hash(self.remote_public_key.as_bytes());
+        // symmetricstate.mix_hash(self.remote_public_key.as_bytes());
 
         Ok(Box::new(NoiseSession {
-            version,
-            symmetricstate,
+            noise_state: handshake_state,
+            // symmetricstate,
             next_keys: None,
             state: State::Initial,
-            side: Side::Client,
-            e,
-            s,
             requested_protocols: self.requested_protocols.clone(),
             supported_protocols: vec![],
             transport_parameters: *params,
             remote_transport_parameters: None,
-            remote_e: None,
             remote_s: Some(self.remote_public_key),
         }))
     }
 }
 
-pub(crate) fn initial_keys(version: u32, dst_cid: &ConnectionId, side: Side) -> Keys {
-    let client = blake3::Hasher::new_derive_key("Noise_IK_25519_ChaChaPoly_BLAKE3 initial key")
-        .update(b"client in")
-        .update(dst_cid)
-        .update(&u32::to_le_bytes(version))
-        .finalize()
-        .into();
-
-    let server = blake3::Hasher::new_derive_key("Noise_IK_25519_ChaChaPoly_BLAKE3 initial key")
-        .update(b"server in")
-        .update(dst_cid)
-        .update(&u32::to_le_bytes(version))
-        .finalize()
-        .into();
-
-    let (local, remote) = match side {
-        Side::Client => (client, server),
-        Side::Server => (server, client),
-    };
-
+pub(crate) fn initial_keys() -> Keys {
     Keys {
-        header: KeyPair {
-            local: Box::new(HeaderProtectionKey::new(local)),
-            remote: Box::new(HeaderProtectionKey::new(remote)),
-        },
+        header: header_keypair(),
         packet: KeyPair {
-            local: Box::new(ChaCha20PacketKey::new(local)),
-            remote: Box::new(ChaCha20PacketKey::new(remote)),
+            local: Box::new(Sensitive(Zeroizing::new([0; 32]))),
+            remote: Box::new(Sensitive(Zeroizing::new([0; 32]))),
         },
     }
 }
@@ -96,41 +89,48 @@ pub(crate) fn initial_keys(version: u32, dst_cid: &ConnectionId, side: Side) -> 
 impl ServerConfig for NoiseServerConfig {
     fn start_session(
         self: Arc<Self>,
-        version: u32,
+        _version: u32,
         params: &TransportParameters,
     ) -> Box<dyn Session> {
-        let s = self.keypair.clone();
-        let e = StaticSecret::random_from_rng(OsRng);
+        let pattern = HandshakePattern::new(
+            &[],
+            &[Token::S],
+            &[
+                &[Token::E, Token::ES, Token::S, Token::SS],
+                &[Token::E, Token::EE, Token::SE],
+            ],
+            "Noise_IK_25519_ChaChaPoly_BLAKE3",
+        );
 
-        let mut symmetricstate = SymmetricState::initialize_symmetric(PROTOCOL_ID.as_bytes());
-
-        // <- s
-        symmetricstate.mix_hash(PublicKey::from(&s).as_bytes());
+        let handshake_state = HandshakeState::<X25519, ChaCha20Poly1305, Blake3>::new(
+            pattern,
+            false,
+            [],
+            Some(Sensitive(Zeroizing::new(self.keypair.to_bytes()))),
+            None,
+            None,
+            None,
+        );
 
         Box::new(NoiseSession {
-            version,
-            symmetricstate,
+            noise_state: handshake_state,
             next_keys: None,
             state: State::Initial,
-            side: Side::Server,
-            e,
-            s,
             requested_protocols: vec![],
             supported_protocols: self.supported_protocols.clone(),
             transport_parameters: *params,
             remote_transport_parameters: None,
-            remote_e: None,
             remote_s: None,
         })
     }
 
     fn initial_keys(
         &self,
-        version: u32,
-        dst_cid: &ConnectionId,
-        side: Side,
+        _version: u32,
+        _dst_cid: &ConnectionId,
+        _side: Side,
     ) -> Result<Keys, quinn_proto::crypto::UnsupportedVersion> {
-        Ok(initial_keys(version, dst_cid, side))
+        Ok(initial_keys())
     }
 
     fn retry_tag(&self, _version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
@@ -153,132 +153,14 @@ impl ServerConfig for NoiseServerConfig {
     }
 }
 
-const PROTOCOL_ID: &str = "Noise_IK_25519_ChaChaPoly_BLAKE3";
-
-#[derive(Copy, Clone, Default)]
-pub(crate) struct SymmetricStateData {}
-
-pub(crate) struct SymmetricState {
-    cipherstate: Option<ChaCha20PacketKey>,
-    h: [u8; 32],
-    ck: [u8; 32],
-}
-
-impl SymmetricState {
-    pub fn initialize_symmetric(protocol_id: &[u8]) -> Self {
-        let h = blake3::hash(protocol_id).into();
-        Self {
-            h,
-            ck: h,
-            cipherstate: None,
-        }
-    }
-
-    pub fn mix_key(&mut self, input_key_material: &[u8]) {
-        // Sets ck, temp_k = HKDF(ck, input_key_material, 2).
-        // If HASHLEN is 64, then truncates temp_k to 32 bytes.
-        // Calls InitializeKey(temp_k).
-        let mut bytes = blake3::Hasher::new_derive_key(
-            "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 mix key",
-        )
-        .update(&self.ck)
-        .update(input_key_material)
-        .finalize_xof();
-        bytes.fill(&mut self.ck);
-        let mut cipher = [0; 32];
-        bytes.fill(&mut cipher);
-        self.cipherstate = Some(ChaCha20PacketKey::new(cipher));
-    }
-
-    pub fn mix_hash(&mut self, data: &[u8]) {
-        self.h = blake3::Hasher::new()
-            .update(&self.h)
-            .update(data)
-            .finalize()
-            .into();
-    }
-
-    // pub fn mix_key_and_hash(&mut self, input_key_material: &[u8]) {
-    //     // Sets ck, temp_h, temp_k = HKDF(ck, input_key_material, 3).
-    //     // Calls MixHash(temp_h).
-    //     // If HASHLEN is 64, then truncates temp_k to 32 bytes.
-    //     // Calls InitializeKey(temp_k).
-    //     let mut bytes = blake3::Hasher::new_derive_key(PROTOCOL_ID)
-    //         .update(&self.ck)
-    //         .update(input_key_material)
-    //         .finalize_xof();
-
-    //     let mut mix = [0; 32];
-    //     let mut cipher = [0; 32];
-    //     bytes.fill(&mut self.ck);
-    //     bytes.fill(&mut mix);
-    //     bytes.fill(&mut cipher);
-
-    //     self.mix_hash(&mix);
-    //     self.cipherstate = Some(ChaCha20PacketKey::new(cipher));
-    // }
-
-    /// Encrypt a message and mixes in the hash of the output
-    pub fn encrypt_and_hash(&mut self, nonce: u64, plaintext: &[u8], buffer: &mut [u8]) -> usize {
-        buffer[..plaintext.len()].copy_from_slice(plaintext);
-        let output_len = if let Some(cipher) = &self.cipherstate {
-            cipher.encrypt_ad(nonce, &self.h, &mut buffer[..plaintext.len() + 16]);
-            plaintext.len() + 16
-        } else {
-            plaintext.len()
-        };
-        self.mix_hash(&buffer[..output_len]);
-        output_len
-    }
-
-    pub fn decrypt_and_hash(
-        &mut self,
-        nonce: u64,
-        ciphertext: &[u8],
-        buffer: &mut [u8],
-    ) -> Result<usize, CryptoError> {
-        let payload_len = if let Some(cipher) = &self.cipherstate {
-            let (ciphertext, tag) = ciphertext.split_at(ciphertext.len() - 16);
-            buffer[..ciphertext.len()].copy_from_slice(ciphertext);
-            cipher.decrypt_ad(nonce, &self.h, tag, &mut buffer[..ciphertext.len()])?;
-            ciphertext.len()
-        } else {
-            buffer[..ciphertext.len()].copy_from_slice(ciphertext);
-            ciphertext.len()
-        };
-        self.mix_hash(ciphertext);
-        Ok(payload_len)
-    }
-
-    pub fn split(&mut self) -> ([u8; 32], [u8; 32]) {
-        let mut bytes = blake3::Hasher::new_derive_key(
-            "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 split key",
-        )
-        .update(&self.ck)
-        .finalize_xof();
-
-        let mut temp_k1 = [0; 32];
-        let mut temp_k2 = [0; 32];
-        bytes.fill(&mut temp_k1);
-        bytes.fill(&mut temp_k2);
-
-        (temp_k1, temp_k2)
-    }
-}
-
 pub struct NoiseSession {
-    version: u32,
-    symmetricstate: SymmetricState,
-    next_keys: Option<KeyPair<[u8; 32]>>,
+    noise_state: HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
+    next_keys: Option<KeyPair<Sensitive<[u8; 32]>>>,
     state: State,
-    side: Side,
-    e: StaticSecret,
-    s: StaticSecret,
     requested_protocols: Vec<Vec<u8>>,
     supported_protocols: Vec<Vec<u8>>,
     transport_parameters: TransportParameters,
     remote_transport_parameters: Option<TransportParameters>,
-    remote_e: Option<PublicKey>,
     remote_s: Option<PublicKey>,
 }
 
@@ -313,72 +195,52 @@ fn split_n<const N: usize>(data: &[u8]) -> Result<(&[u8; N], &[u8]), TransportEr
 
 impl NoiseSession {
     fn get_header_keys(&self) -> KeyPair<Box<dyn HeaderKey>> {
-        let KeyPair { local, remote } = *self.next_keys.as_ref().unwrap();
-        KeyPair {
-            local: Box::new(HeaderProtectionKey::new(local)),
-            remote: Box::new(HeaderProtectionKey::new(remote)),
+        header_keypair()
+    }
+}
+
+fn noise_error(e: noise_protocol::Error) -> TransportError {
+    match e.kind() {
+        noise_protocol::ErrorKind::DH => {
+            unreachable!("this diffie-hellman implementation cannot fail")
         }
+        noise_protocol::ErrorKind::NeedPSK => {
+            unreachable!("this noise implementation should not need PSK")
+        }
+        noise_protocol::ErrorKind::Decryption => {
+            connection_refused("could not decrypt handshake message")
+        }
+        noise_protocol::ErrorKind::TooShort => connection_refused("handshake message is too short"),
     }
 }
 
 impl Session for NoiseSession {
-    fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
-        initial_keys(self.version, dst_cid, side)
+    fn initial_keys(&self, _dst_cid: &ConnectionId, _side: Side) -> Keys {
+        initial_keys()
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        let KeyPair { local, remote } = *self.next_keys.as_ref()?;
-        self.next_keys = Some(KeyPair {
-            local: blake3::derive_key(
-                "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 update key",
-                &local,
-            ),
-            remote: blake3::derive_key(
-                "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 update key",
-                &remote,
-            ),
-        });
-
+        let KeyPair { local, remote } = self.next_keys.as_mut()?;
+        let next_local = ChaCha20Poly1305::rekey(local);
+        let next_remote = ChaCha20Poly1305::rekey(remote);
         Some(KeyPair {
-            local: Box::new(ChaCha20PacketKey::new(local)),
-            remote: Box::new(ChaCha20PacketKey::new(remote)),
+            local: Box::new(std::mem::replace(local, next_local)),
+            remote: Box::new(std::mem::replace(remote, next_remote)),
         })
     }
 
     fn read_handshake(&mut self, handshake: &[u8]) -> Result<bool, TransportError> {
-        match (self.state, self.side) {
-            (State::Initial, Side::Server) => {
-                // -> e
-                let (re, rest) = split_n(handshake)?;
-                self.symmetricstate.mix_hash(re);
-                let re = PublicKey::from(*re);
-                self.remote_e = Some(re);
+        let client = self.noise_state.get_is_initiator();
 
-                // -> es
-                let es = self.s.diffie_hellman(&re);
-                self.symmetricstate.mix_key(es.as_bytes());
-
-                // -> s
-                let (remote_s, rest) = split_n::<48>(rest)?;
-                let mut rs = [0; 32];
-                self.symmetricstate
-                    .decrypt_and_hash(0, remote_s, &mut rs)
-                    .map_err(|_| connection_refused("invalid static public key1"))?;
-                let rs = PublicKey::from(rs);
-                self.remote_s = Some(rs);
-
-                // -> ss
-                let ss = self.s.diffie_hellman(&rs);
-                self.symmetricstate.mix_key(ss.as_bytes());
-
-                // payload
-                let mut payload = vec![0; rest.len() - 16];
-                self.symmetricstate
-                    .decrypt_and_hash(0, rest, &mut payload)
-                    .map_err(|_| connection_refused("invalid static public key3"))?;
+        match (self.state, client) {
+            (State::Initial, false) => {
+                let trailing = self
+                    .noise_state
+                    .read_message_vec(handshake)
+                    .map_err(noise_error)?;
 
                 // alpn
-                let (&[len], rest) = split_n(&payload)?;
+                let (&[len], rest) = split_n(&trailing)?;
                 let (mut alpns, mut transport_params) = split(rest, len as usize)?;
 
                 if !self.supported_protocols.is_empty() {
@@ -410,29 +272,14 @@ impl Session for NoiseSession {
                 self.state = State::ZeroRtt;
                 Ok(!self.requested_protocols.is_empty())
             }
-            (State::Handshake, Side::Client) => {
-                // <- e
-                let (re, rest) = split_n::<32>(handshake)?;
-                self.symmetricstate.mix_hash(re);
-                let re = PublicKey::from(*re);
-                self.remote_e = Some(re);
-
-                // <- ee
-                let ee = self.e.diffie_hellman(&re);
-                self.symmetricstate.mix_key(ee.as_bytes());
-
-                // <- se
-                let se = self.s.diffie_hellman(&re);
-                self.symmetricstate.mix_key(se.as_bytes());
-
-                // payload
-                let mut payload = vec![0; rest.len() - 16];
-                self.symmetricstate
-                    .decrypt_and_hash(0, rest, &mut payload)
-                    .map_err(|_| connection_refused("invalid payload"))?;
+            (State::Handshake, true) => {
+                let trailing = self
+                    .noise_state
+                    .read_message_vec(handshake)
+                    .map_err(noise_error)?;
 
                 // alpn
-                let (&[len], rest) = split_n(&payload)?;
+                let (&[len], rest) = split_n(&trailing)?;
                 let (alpn, mut transport_params) = split(rest, len as usize)?;
                 if !self.requested_protocols.is_empty() {
                     if alpn.is_empty() {
@@ -458,31 +305,10 @@ impl Session for NoiseSession {
     }
 
     fn write_handshake(&mut self, handshake: &mut Vec<u8>) -> Option<Keys> {
-        match (self.state, self.side) {
-            (State::Initial, Side::Client) => {
-                // -> e
-                self.symmetricstate
-                    .mix_hash(PublicKey::from(&self.e).as_bytes());
-                handshake.extend_from_slice(PublicKey::from(&self.e).as_bytes());
+        let is_client = self.noise_state.get_is_initiator();
 
-                // -> es
-                let es = self.e.diffie_hellman(&self.remote_s.unwrap());
-                self.symmetricstate.mix_key(es.as_bytes());
-
-                // -> s
-                let mut s = [0; 48];
-                self.symmetricstate.encrypt_and_hash(
-                    0,
-                    PublicKey::from(&self.s).as_bytes(),
-                    &mut s,
-                );
-                handshake.extend_from_slice(&s);
-
-                // -> ss
-                let s = self.remote_s.unwrap();
-                let ss = self.s.diffie_hellman(&s);
-                self.symmetricstate.mix_key(ss.as_bytes());
-
+        match (self.state, is_client) {
+            (State::Initial, true) => {
                 // payload
                 let mut payload = vec![];
 
@@ -500,23 +326,29 @@ impl Session for NoiseSession {
 
                 self.transport_parameters.write(&mut payload);
 
-                let i = handshake.len();
-                handshake.resize(i + 16 + payload.len(), 0);
-                self.symmetricstate
-                    .encrypt_and_hash(0, &payload, &mut handshake[i..]);
+                let overhead = self.noise_state.get_next_message_overhead();
+                handshake.resize(overhead + payload.len(), 0);
+                self.noise_state.write_message(&payload, handshake).unwrap();
 
                 // 0-rtt
                 self.state = State::ZeroRtt;
                 None
             }
             (State::ZeroRtt, _) => {
-                let (client, server) = self.symmetricstate.split();
-                let kp = match self.side {
-                    Side::Client => KeyPair {
+                let (client, server) = self.noise_state.get_ciphers();
+                let (client, 0) = client.extract() else {
+                    panic!("expected nonce to be 0")
+                };
+                let (server, 0) = server.extract() else {
+                    panic!("expected nonce to be 0")
+                };
+
+                let kp = match is_client {
+                    true => KeyPair {
                         local: client,
                         remote: server,
                     },
-                    Side::Server => KeyPair {
+                    false => KeyPair {
                         local: server,
                         remote: client,
                     },
@@ -528,20 +360,7 @@ impl Session for NoiseSession {
                     packet: self.next_1rtt_keys().unwrap(),
                 })
             }
-            (State::Handshake, Side::Server) => {
-                // <- e
-                self.symmetricstate
-                    .mix_hash(PublicKey::from(&self.e).as_bytes());
-                handshake.extend_from_slice(PublicKey::from(&self.e).as_bytes());
-
-                // <- ee
-                let ee = self.e.diffie_hellman(&self.remote_e.unwrap());
-                self.symmetricstate.mix_key(ee.as_bytes());
-
-                // <- se
-                let se = self.e.diffie_hellman(&self.remote_s.unwrap());
-                self.symmetricstate.mix_key(se.as_bytes());
-
+            (State::Handshake, false) => {
                 // payload
                 let mut payload = vec![];
 
@@ -553,22 +372,22 @@ impl Session for NoiseSession {
 
                 self.transport_parameters.write(&mut payload);
 
-                let i = handshake.len();
-                handshake.resize(i + 16 + payload.len(), 0);
-                self.symmetricstate
-                    .encrypt_and_hash(0, &payload, &mut handshake[i..]);
+                let overhead = self.noise_state.get_next_message_overhead();
+                handshake.resize(overhead + payload.len(), 0);
+                self.noise_state.write_message(&payload, handshake).unwrap();
 
                 // 1-rtt keys
-                let (client, server) = self.symmetricstate.split();
-                let kp = match self.side {
-                    Side::Client => KeyPair {
-                        local: client,
-                        remote: server,
-                    },
-                    Side::Server => KeyPair {
-                        local: server,
-                        remote: client,
-                    },
+                let (client, server) = self.noise_state.get_ciphers();
+                let (client, 0) = client.extract() else {
+                    panic!("expected nonce to be 0")
+                };
+                let (server, 0) = server.extract() else {
+                    panic!("expected nonce to be 0")
+                };
+
+                let kp = KeyPair {
+                    local: server,
+                    remote: client,
                 };
                 self.next_keys = Some(kp);
                 self.state = State::Data;
@@ -578,13 +397,20 @@ impl Session for NoiseSession {
                 })
             }
             (State::OneRtt, _) => {
-                let (client, server) = self.symmetricstate.split();
-                let kp = match self.side {
-                    Side::Client => KeyPair {
+                let (client, server) = self.noise_state.get_ciphers();
+                let (client, 0) = client.extract() else {
+                    panic!("expected nonce to be 0")
+                };
+                let (server, 0) = server.extract() else {
+                    panic!("expected nonce to be 0")
+                };
+
+                let kp = match is_client {
+                    true => KeyPair {
                         local: client,
                         remote: server,
                     },
-                    Side::Server => KeyPair {
+                    false => KeyPair {
                         local: server,
                         remote: client,
                     },
@@ -609,7 +435,7 @@ impl Session for NoiseSession {
     }
 
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
-        if self.state == State::Handshake && self.side == Side::Client {
+        if self.state == State::Handshake && self.noise_state.get_is_initiator() {
             Ok(Some(self.transport_parameters))
         } else {
             Ok(self.remote_transport_parameters)
@@ -630,7 +456,7 @@ impl Session for NoiseSession {
             "QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 export keying material",
         )
         .update(context)
-        .update(&self.symmetricstate.ck)
+        .update(self.noise_state.get_hash())
         .update(label)
         .finalize_xof()
         .fill(output);

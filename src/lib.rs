@@ -2,7 +2,7 @@ mod aead;
 mod session;
 
 pub use crate::session::{NoiseClientConfig, NoiseServerConfig};
-pub use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
+pub use x25519_dalek::{PublicKey, StaticSecret};
 
 // https://github.com/quicwg/base-drafts/wiki/QUIC-Versions
 // reserved versions for quinn-noise 0xf0f0f2f[0-f]
