@@ -1,31 +1,15 @@
 use bytes::BytesMut;
-use quinn_proto::crypto::{CryptoError, HeaderKey, KeyPair, PacketKey};
-use rand_core::OsRng;
+use noise_protocol::Cipher;
+use quinn_proto::crypto::{CryptoError, PacketKey};
 use ring::aead;
 
-pub fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
-    KeyPair {
-        local: Box::new(PlaintextHeaderKey),
-        remote: Box::new(PlaintextHeaderKey),
-    }
-}
-
-pub struct PlaintextHeaderKey;
-impl HeaderKey for PlaintextHeaderKey {
-    fn decrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
-
-    fn encrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
-
-    fn sample_size(&self) -> usize {
-        0
-    }
-}
+use super::Sensitive;
 
 const TAGLEN: usize = 16;
 
 pub enum ChaCha20Poly1305 {}
 
-impl noise_protocol::Cipher for ChaCha20Poly1305 {
+impl Cipher for ChaCha20Poly1305 {
     fn name() -> &'static str {
         "ChaChaPoly"
     }
@@ -160,108 +144,4 @@ impl PacketKey for Sensitive<[u8; 32]> {
     fn integrity_limit(&self) -> u64 {
         1 << 30
     }
-}
-
-use noise_protocol::{Cipher, U8Array};
-use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::{Zeroize, Zeroizing};
-
-/// Struct holding a value that is safely zeroed on drop.
-pub struct Sensitive<A: U8Array + Zeroize>(pub Zeroizing<A>);
-
-impl<A: U8Array + Zeroize> Sensitive<A> {
-    pub fn from(a: Zeroizing<A>) -> Self {
-        Sensitive(a)
-    }
-}
-
-impl<A: U8Array + Zeroize> core::ops::Deref for Sensitive<A> {
-    type Target = A;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<A: U8Array + Zeroize> core::ops::DerefMut for Sensitive<A> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<A> U8Array for Sensitive<A>
-where
-    A: Zeroize + U8Array,
-{
-    fn new() -> Self {
-        Sensitive::from(Zeroizing::new(A::new()))
-    }
-
-    fn new_with(v: u8) -> Self {
-        Sensitive::from(Zeroizing::new(A::new_with(v)))
-    }
-
-    fn from_slice(s: &[u8]) -> Self {
-        Sensitive::from(Zeroizing::new(A::from_slice(s)))
-    }
-
-    fn len() -> usize {
-        A::len()
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.0.as_mut()
-    }
-}
-
-pub enum X25519 {}
-
-impl noise_protocol::DH for X25519 {
-    type Key = Sensitive<[u8; 32]>;
-    type Pubkey = [u8; 32];
-    type Output = Sensitive<[u8; 32]>;
-
-    fn name() -> &'static str {
-        "25519"
-    }
-
-    fn genkey() -> Self::Key {
-        Self::Key::from_slice(StaticSecret::random_from_rng(OsRng).as_bytes())
-    }
-
-    fn pubkey(k: &Self::Key) -> Self::Pubkey {
-        let static_secret = StaticSecret::from(**k);
-        *PublicKey::from(&static_secret).as_bytes()
-    }
-
-    fn dh(k: &Self::Key, pk: &Self::Pubkey) -> Result<Self::Output, ()> {
-        let k = StaticSecret::from(**k);
-        let pk = PublicKey::from(*pk);
-        Ok(Self::Output::from_slice(k.diffie_hellman(&pk).as_bytes()))
-    }
-}
-
-#[derive(Default, Clone)]
-pub struct Blake3(blake3::Hasher);
-
-impl noise_protocol::Hash for Blake3 {
-    fn name() -> &'static str {
-        "BLAKE3"
-    }
-
-    type Block = [u8; 64];
-    type Output = Sensitive<[u8; 32]>;
-
-    fn input(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-
-    fn result(&mut self) -> Self::Output {
-        Sensitive(Zeroizing::new(self.0.finalize().into()))
-    }
-
-    // TODO: maybe use blake3 kdf instead of hkdf?
 }

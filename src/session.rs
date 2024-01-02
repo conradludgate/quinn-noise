@@ -1,78 +1,53 @@
-use crate::aead::{header_keypair, Blake3, ChaCha20Poly1305, Sensitive, X25519};
 use noise_protocol::patterns::{HandshakePattern, Token};
-use noise_protocol::{Cipher, HandshakeState};
+use noise_protocol::Cipher;
 use quinn_proto::crypto::{
-    ClientConfig, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, ServerConfig,
-    Session,
+    ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, Session,
 };
 use quinn_proto::transport_parameters::TransportParameters;
-use quinn_proto::{ConnectError, ConnectionId, Side, TransportError, TransportErrorCode};
+use quinn_proto::{ConnectionId, Side, TransportError, TransportErrorCode};
 use ring::aead;
 use std::any::Any;
 use std::convert::TryInto;
-use std::sync::Arc;
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::PublicKey;
 use zeroize::Zeroizing;
 
-pub struct NoiseClientConfig {
-    /// Keypair to use.
-    pub keypair: StaticSecret,
-    /// The remote public key. This needs to be set.
-    pub remote_public_key: PublicKey,
-    /// Requested ALPN identifiers.
-    pub requested_protocols: Vec<Vec<u8>>,
+use crate::noise_impl::{ChaCha20Poly1305, HandshakeState, Sensitive};
+use crate::HandshakeData;
+
+mod client;
+mod server;
+
+fn handshake_pattern() -> HandshakePattern {
+    HandshakePattern::new(
+        &[],
+        &[Token::S],
+        &[
+            &[Token::E, Token::ES, Token::S, Token::SS],
+            &[Token::E, Token::EE, Token::SE],
+        ],
+        "Noise_IK_25519_ChaChaPoly_BLAKE3",
+    )
 }
 
-pub struct NoiseServerConfig {
-    /// Keypair to use.
-    pub keypair: StaticSecret,
-    /// Supported ALPN identifiers.
-    pub supported_protocols: Vec<Vec<u8>>,
-}
+fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
+    struct PlaintextHeaderKey;
+    impl HeaderKey for PlaintextHeaderKey {
+        fn decrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
 
-impl ClientConfig for NoiseClientConfig {
-    fn start_session(
-        self: Arc<Self>,
-        _version: u32,
-        _server_name: &str,
-        params: &TransportParameters,
-    ) -> Result<Box<dyn Session>, ConnectError> {
-        let pattern = HandshakePattern::new(
-            &[],
-            &[Token::S],
-            &[
-                &[Token::E, Token::ES, Token::S, Token::SS],
-                &[Token::E, Token::EE, Token::SE],
-            ],
-            "Noise_IK_25519_ChaChaPoly_BLAKE3",
-        );
+        fn encrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
 
-        let handshake_state = HandshakeState::<X25519, ChaCha20Poly1305, Blake3>::new(
-            pattern,
-            true,
-            [],
-            Some(Sensitive(Zeroizing::new(self.keypair.to_bytes()))),
-            None,
-            Some(self.remote_public_key.to_bytes()),
-            None,
-        );
+        fn sample_size(&self) -> usize {
+            0
+        }
+    }
 
-        Ok(Box::new(NoiseSession {
-            state: Ok(Box::new(ClientInitial {
-                state: handshake_state,
-            })),
-            data: Data {
-                requested_protocols: self.requested_protocols.clone(),
-                supported_protocols: vec![],
-                transport_parameters: *params,
-                remote_transport_parameters: None,
-                remote_s: Some(self.remote_public_key),
-            },
-        }))
+    KeyPair {
+        local: Box::new(PlaintextHeaderKey),
+        remote: Box::new(PlaintextHeaderKey),
     }
 }
 
-pub(crate) fn initial_keys() -> Keys {
+fn initial_keys() -> Keys {
     Keys {
         header: header_keypair(),
         packet: KeyPair {
@@ -82,85 +57,16 @@ pub(crate) fn initial_keys() -> Keys {
     }
 }
 
-impl ServerConfig for NoiseServerConfig {
-    fn start_session(
-        self: Arc<Self>,
-        _version: u32,
-        params: &TransportParameters,
-    ) -> Box<dyn Session> {
-        let pattern = HandshakePattern::new(
-            &[],
-            &[Token::S],
-            &[
-                &[Token::E, Token::ES, Token::S, Token::SS],
-                &[Token::E, Token::EE, Token::SE],
-            ],
-            "Noise_IK_25519_ChaChaPoly_BLAKE3",
-        );
-
-        let handshake_state = HandshakeState::<X25519, ChaCha20Poly1305, Blake3>::new(
-            pattern,
-            false,
-            [],
-            Some(Sensitive(Zeroizing::new(self.keypair.to_bytes()))),
-            None,
-            None,
-            None,
-        );
-
-        Box::new(NoiseSession {
-            state: Ok(Box::new(ServerInitial {
-                state: handshake_state,
-            })),
-            data: Data {
-                requested_protocols: vec![],
-                supported_protocols: self.supported_protocols.clone(),
-                transport_parameters: *params,
-                remote_transport_parameters: None,
-                remote_s: None,
-            },
-        })
-    }
-
-    fn initial_keys(
-        &self,
-        _version: u32,
-        _dst_cid: &ConnectionId,
-        _side: Side,
-    ) -> Result<Keys, quinn_proto::crypto::UnsupportedVersion> {
-        Ok(initial_keys())
-    }
-
-    fn retry_tag(&self, _version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
-        let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
-        pseudo_packet.push(orig_dst_cid.len() as u8);
-        pseudo_packet.extend_from_slice(orig_dst_cid);
-        pseudo_packet.extend_from_slice(packet);
-
-        let nonce = aead::Nonce::assume_unique_for_key(RETRY_INTEGRITY_NONCE);
-        let key = aead::LessSafeKey::new(
-            aead::UnboundKey::new(&aead::AES_128_GCM, &RETRY_INTEGRITY_KEY).unwrap(),
-        );
-
-        let tag = key
-            .seal_in_place_separate_tag(nonce, aead::Aad::from(pseudo_packet), &mut [])
-            .unwrap();
-        let mut result = [0; 16];
-        result.copy_from_slice(tag.as_ref());
-        result
-    }
-}
-
-trait TState: 'static + Send + Sync {
+trait State: 'static + Send + Sync {
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
         None
     }
 
     fn read_handshake(
         self: Box<Self>,
-        _data: &mut Data,
+        _data: &mut CommonData,
         _handshake: &[u8],
-    ) -> Result<Box<dyn TState>, TransportError> {
+    ) -> Result<Box<dyn State>, TransportError> {
         Err(TransportError {
             code: TransportErrorCode::CONNECTION_REFUSED,
             frame: None,
@@ -171,9 +77,9 @@ trait TState: 'static + Send + Sync {
     #[allow(clippy::type_complexity)]
     fn write_handshake(
         self: Box<Self>,
-        data: &Data,
+        data: &CommonData,
         handshake: &mut Vec<u8>,
-    ) -> (Box<dyn TState>, Option<KeyPair<Sensitive<[u8; 32]>>>);
+    ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>);
 
     fn is_handshaking(&self) -> bool {
         true
@@ -184,81 +90,7 @@ trait TState: 'static + Send + Sync {
     }
 }
 
-struct ServerInitial {
-    state: HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
-}
-
-struct ServerZeroRTT {
-    state: HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
-    alpn: Option<Vec<u8>>,
-}
-
-struct ServerHandshake {
-    state: HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
-    alpn: Option<Vec<u8>>,
-}
-
-impl TState for ServerInitial {
-    fn read_handshake(
-        mut self: Box<Self>,
-        data: &mut Data,
-        handshake: &[u8],
-    ) -> Result<Box<dyn TState>, TransportError> {
-        println!("read Initial server");
-        let trailing = self
-            .state
-            .read_message_vec(handshake)
-            .map_err(noise_error)?;
-
-        // alpn
-        let (&[len], rest) = split_n(&trailing)?;
-        let (mut alpns, mut transport_params) = split(rest, len as usize)?;
-
-        let mut found_alpn = None;
-        if !data.supported_protocols.is_empty() {
-            while !alpns.is_empty() {
-                let (&[len], next) = split_n(alpns)?;
-                let (alpn, next_alpn) = split(next, len as usize)?;
-                alpns = next_alpn;
-                let found = data
-                    .supported_protocols
-                    .iter()
-                    .any(|proto| proto.as_slice() == alpn);
-
-                if found {
-                    found_alpn = Some(alpn.to_vec());
-                    break;
-                }
-            }
-            if found_alpn.is_none() {
-                return Err(connection_refused("unsupported alpn"));
-            }
-        }
-
-        data.remote_transport_parameters = Some(TransportParameters::read(
-            Side::Server,
-            &mut transport_params,
-        )?);
-
-        Ok(Box::new(ServerZeroRTT {
-            state: self.state,
-            alpn: found_alpn,
-        }))
-    }
-
-    fn write_handshake(
-        self: Box<Self>,
-        _data: &Data,
-        _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn TState>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        println!("write Initial server");
-        (self, None)
-    }
-}
-
-fn client_server(
-    state: &HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
-) -> (Sensitive<[u8; 32]>, Sensitive<[u8; 32]>) {
+fn client_server(state: &HandshakeState) -> (Sensitive<[u8; 32]>, Sensitive<[u8; 32]>) {
     let (client, server) = state.get_ciphers();
     let (client, 0) = client.extract() else {
         panic!("expected nonce to be 0")
@@ -268,222 +100,13 @@ fn client_server(
     };
     (client, server)
 }
-fn server_keys(
-    state: &HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
-) -> KeyPair<Sensitive<[u8; 32]>> {
-    let (client, server) = client_server(state);
-    KeyPair {
-        local: server,
-        remote: client,
-    }
-}
 
-impl TState for ServerZeroRTT {
-    fn write_handshake(
-        self: Box<Self>,
-        _data: &Data,
-        _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn TState>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        println!("write ZeroRTT server");
-        let keys = server_keys(&self.state);
-        (
-            Box::new(ServerHandshake {
-                state: self.state,
-                alpn: self.alpn,
-            }),
-            Some(keys),
-        )
-    }
-}
-
-impl TState for ServerHandshake {
-    fn write_handshake(
-        mut self: Box<Self>,
-        data: &Data,
-        handshake: &mut Vec<u8>,
-    ) -> (Box<dyn TState>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        println!("write Handshake server");
-        // payload
-        let mut payload = vec![];
-
-        // alpn
-        if let [alpn] = &*data.requested_protocols {
-            payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
-            payload.extend_from_slice(alpn);
-        }
-
-        data.transport_parameters.write(&mut payload);
-
-        let overhead = self.state.get_next_message_overhead();
-        handshake.resize(overhead + payload.len(), 0);
-        self.state.write_message(&payload, handshake).unwrap();
-
-        let mut data = DataState {
-            hash: self.state.get_hash().try_into().unwrap(),
-            keys: server_keys(&self.state),
-            alpn: self.alpn,
-        };
-
-        let keys = data.next_keys();
-        (Box::new(data), Some(keys))
-    }
-}
-
-struct ClientInitial {
-    state: HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
-}
-
-struct ClientZeroRTT {
-    state: HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
-}
-
-struct ClientHandshake {
-    state: HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
-}
-
-struct ClientOneRTT {
+struct Data {
     keys: KeyPair<Sensitive<[u8; 32]>>,
     hash: [u8; 32],
-    alpn: Option<Vec<u8>>,
 }
 
-impl TState for ClientInitial {
-    fn write_handshake(
-        mut self: Box<Self>,
-        data: &Data,
-        handshake: &mut Vec<u8>,
-    ) -> (Box<dyn TState>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        println!("write Initial client");
-
-        // payload
-        let mut payload = vec![];
-
-        // alpn
-        let len = data
-            .requested_protocols
-            .iter()
-            .map(|s| s.len() as u8 + 1)
-            .sum::<u8>();
-        payload.extend_from_slice(&len.to_le_bytes());
-        for alpn in &data.requested_protocols {
-            payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
-            payload.extend_from_slice(alpn);
-        }
-
-        data.transport_parameters.write(&mut payload);
-
-        let overhead = self.state.get_next_message_overhead();
-        handshake.resize(overhead + payload.len(), 0);
-        self.state.write_message(&payload, handshake).unwrap();
-
-        (Box::new(ClientZeroRTT { state: self.state }), None)
-    }
-}
-
-fn client_keys(
-    state: &HandshakeState<X25519, ChaCha20Poly1305, Blake3>,
-) -> KeyPair<Sensitive<[u8; 32]>> {
-    let (client, server) = client_server(state);
-    KeyPair {
-        local: client,
-        remote: server,
-    }
-}
-
-impl TState for ClientZeroRTT {
-    fn write_handshake(
-        self: Box<Self>,
-        _data: &Data,
-        _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn TState>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        println!("write ZeroRTT client");
-        let keys = client_keys(&self.state);
-        (Box::new(ClientHandshake { state: self.state }), Some(keys))
-    }
-}
-
-impl TState for ClientHandshake {
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        None
-    }
-
-    fn read_handshake(
-        mut self: Box<Self>,
-        data: &mut Data,
-        handshake: &[u8],
-    ) -> Result<Box<dyn TState>, TransportError> {
-        println!("read Handshake client");
-        let trailing = self
-            .state
-            .read_message_vec(handshake)
-            .map_err(noise_error)?;
-
-        // alpn
-        let (&[len], rest) = split_n(&trailing)?;
-        let (alpn, mut transport_params) = split(rest, len as usize)?;
-        let mut found_alpn = None;
-        if !data.requested_protocols.is_empty() {
-            if alpn.is_empty() {
-                return Err(connection_refused("unsupported alpn"));
-            }
-            found_alpn = Some(alpn.to_vec());
-        }
-
-        data.remote_transport_parameters = Some(TransportParameters::read(
-            Side::Client,
-            &mut transport_params,
-        )?);
-
-        Ok(Box::new(ClientOneRTT {
-            hash: self.state.get_hash().try_into().unwrap(),
-            keys: client_keys(&self.state),
-            alpn: found_alpn,
-        }))
-    }
-
-    fn write_handshake(
-        self: Box<Self>,
-        _data: &Data,
-        _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn TState>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        println!("write Handshake client");
-        (self, None)
-    }
-}
-
-impl TState for ClientOneRTT {
-    fn write_handshake(
-        self: Box<Self>,
-        _data: &Data,
-        _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn TState>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        println!("write OneRTT client");
-        let mut data = DataState {
-            hash: self.hash,
-            keys: self.keys,
-            alpn: self.alpn,
-        };
-
-        let keys = data.next_keys();
-        (Box::new(data), Some(keys))
-    }
-
-    fn is_handshaking(&self) -> bool {
-        false
-    }
-
-    fn get_channel_binding(&self) -> &[u8] {
-        &self.hash
-    }
-}
-
-struct DataState {
-    keys: KeyPair<Sensitive<[u8; 32]>>,
-    hash: [u8; 32],
-    alpn: Option<Vec<u8>>,
-}
-
-impl DataState {
+impl Data {
     fn next_keys(&mut self) -> KeyPair<Sensitive<[u8; 32]>> {
         let KeyPair { local, remote } = &mut self.keys;
         let next_local = ChaCha20Poly1305::rekey(local);
@@ -495,7 +118,7 @@ impl DataState {
     }
 }
 
-impl TState for DataState {
+impl State for Data {
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
         let keys = self.next_keys();
         Some(KeyPair {
@@ -506,10 +129,9 @@ impl TState for DataState {
 
     fn write_handshake(
         self: Box<Self>,
-        _data: &Data,
+        _data: &CommonData,
         _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn TState>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        println!("write Data");
+    ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
         (self, None)
     }
 
@@ -522,12 +144,12 @@ impl TState for DataState {
     }
 }
 
-pub struct NoiseSession {
-    state: Result<Box<dyn TState>, TransportError>,
-    data: Data,
+struct NoiseSession {
+    state: Result<Box<dyn State>, TransportError>,
+    data: CommonData,
 }
 
-struct Data {
+struct CommonData {
     requested_protocols: Vec<Vec<u8>>,
     supported_protocols: Vec<Vec<u8>>,
     transport_parameters: TransportParameters,
@@ -550,6 +172,7 @@ fn split(data: &[u8], n: usize) -> Result<(&[u8], &[u8]), TransportError> {
         Ok(data.split_at(n))
     }
 }
+
 fn split_n<const N: usize>(data: &[u8]) -> Result<(&[u8; N], &[u8]), TransportError> {
     let (n, data) = split(data, N)?;
     Ok((n.try_into().unwrap(), data))
@@ -625,7 +248,9 @@ impl Session for NoiseSession {
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
-        Some(Box::new(self.data.requested_protocols.get(0)?.clone()))
+        Some(Box::new(HandshakeData {
+            alpn: self.data.requested_protocols.get(0)?.clone(),
+        }))
     }
 
     fn export_keying_material(

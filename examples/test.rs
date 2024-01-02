@@ -4,29 +4,44 @@ use std::{
 };
 
 use anyhow::{ensure, Context, Result};
+use quinn_noise::HandshakeData;
 use rand_core::OsRng;
+use x25519_dalek::PublicKey;
 
 #[tokio::main]
 async fn main() {
-    let secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-    let public_key = x25519_dalek::PublicKey::from(&secret_key);
+    let server_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+    let server_public_key = x25519_dalek::PublicKey::from(&server_secret_key);
 
-    let (server_addr, endpoint) = server_endpoint(secret_key);
+    let client_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+    let client_public_key = x25519_dalek::PublicKey::from(&client_secret_key);
+
+    let (server_addr, endpoint) = server_endpoint(server_secret_key);
 
     tokio::spawn(async move {
-        if let Err(e) = server(endpoint).await {
+        if let Err(e) = server(endpoint, client_public_key).await {
             eprintln!("server failed: {e:#}");
         }
     });
-    if let Err(e) = client(server_addr, public_key).await {
+    if let Err(e) = client(server_addr, client_secret_key, server_public_key).await {
         eprintln!("client failed: {e:#}");
     }
 }
 
-async fn server(endpoint: quinn::Endpoint) -> Result<()> {
+async fn server(
+    endpoint: quinn::Endpoint,
+    remote_public_key: x25519_dalek::PublicKey,
+) -> Result<()> {
     loop {
         let handshake = endpoint.accept().await.unwrap();
         let connection = handshake.await.context("handshake failed")?;
+
+        let peer = connection
+            .peer_identity()
+            .unwrap()
+            .downcast::<PublicKey>()
+            .unwrap();
+        assert_eq!(*peer, remote_public_key);
 
         tokio::spawn(async move {
             loop {
@@ -49,8 +64,12 @@ async fn server(endpoint: quinn::Endpoint) -> Result<()> {
     }
 }
 
-async fn client(server_addr: SocketAddr, remote_public_key: x25519_dalek::PublicKey) -> Result<()> {
-    let (endpoint, connection) = connect_client(server_addr, remote_public_key).await?;
+async fn client(
+    server_addr: SocketAddr,
+    keypair: x25519_dalek::StaticSecret,
+    remote_public_key: x25519_dalek::PublicKey,
+) -> Result<()> {
+    let (endpoint, connection) = connect_client(server_addr, keypair, remote_public_key).await?;
     let connection = Arc::new(connection);
 
     let (mut send_stream, mut recv_stream) = connection
@@ -78,7 +97,7 @@ async fn client(server_addr: SocketAddr, remote_public_key: x25519_dalek::Public
 fn server_endpoint(keypair: x25519_dalek::StaticSecret) -> (SocketAddr, quinn::Endpoint) {
     let crypto = Arc::new(quinn_noise::NoiseServerConfig {
         keypair,
-        supported_protocols: vec![b"test".to_vec()],
+        supported_protocols: vec![b"test1".to_vec(), b"test2".to_vec()],
     });
 
     let server_config = quinn::ServerConfig::with_crypto(crypto);
@@ -92,12 +111,12 @@ fn server_endpoint(keypair: x25519_dalek::StaticSecret) -> (SocketAddr, quinn::E
 /// Create a client endpoint and client connection
 pub async fn connect_client(
     server_addr: SocketAddr,
+    keypair: x25519_dalek::StaticSecret,
     remote_public_key: x25519_dalek::PublicKey,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    let keypair = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let crypto = quinn_noise::NoiseClientConfig {
         remote_public_key,
-        requested_protocols: vec![b"test".to_vec()],
+        requested_protocols: vec![b"test3".to_vec(), b"test1".to_vec(), b"test2".to_vec()],
         keypair,
     };
 
@@ -110,6 +129,20 @@ pub async fn connect_client(
         .unwrap()
         .await
         .context("unable to connect")?;
+
+    let peer = connection
+        .peer_identity()
+        .unwrap()
+        .downcast::<PublicKey>()
+        .unwrap();
+    assert_eq!(*peer, remote_public_key);
+
+    let data = connection
+        .handshake_data()
+        .unwrap()
+        .downcast::<HandshakeData>()
+        .unwrap();
+    assert_eq!(data.alpn, b"test1");
 
     Ok((endpoint, connection))
 }

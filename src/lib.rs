@@ -1,7 +1,6 @@
-mod aead;
+mod noise_impl;
 mod session;
 
-pub use crate::session::{NoiseClientConfig, NoiseServerConfig};
 pub use x25519_dalek::{PublicKey, StaticSecret};
 
 // https://github.com/quicwg/base-drafts/wiki/QUIC-Versions
@@ -12,3 +11,23 @@ pub use x25519_dalek::{PublicKey, StaticSecret};
 // jurisdiction over this registered version set. But I am doing it anyway
 pub const SUPPORTED_QUIC_VERSIONS: &[u32] = &[0xf0f0f2f1];
 pub const DEFAULT_QUIC_VERSION: u32 = 0xf0f0f2f1;
+
+pub struct NoiseClientConfig {
+    /// Keypair to use.
+    pub keypair: StaticSecret,
+    /// The remote public key. This needs to be set.
+    pub remote_public_key: PublicKey,
+    /// Requested ALPN identifiers.
+    pub requested_protocols: Vec<Vec<u8>>,
+}
+
+pub struct NoiseServerConfig {
+    /// Keypair to use.
+    pub keypair: StaticSecret,
+    /// Supported ALPN identifiers.
+    pub supported_protocols: Vec<Vec<u8>>,
+}
+
+pub struct HandshakeData {
+    pub alpn: Vec<u8>,
+}
