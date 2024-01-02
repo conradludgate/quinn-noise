@@ -1,10 +1,11 @@
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
 
 use anyhow::{ensure, Context, Result};
-use quinn_noise::HandshakeData;
+use quinn_noise::{HandshakeData, PublicKeyVerifier};
 use rand_core::OsRng;
 use x25519_dalek::PublicKey;
 
@@ -16,7 +17,7 @@ async fn main() {
     let client_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let client_public_key = x25519_dalek::PublicKey::from(&client_secret_key);
 
-    let (server_addr, endpoint) = server_endpoint(server_secret_key);
+    let (server_addr, endpoint) = server_endpoint(server_secret_key, client_public_key);
 
     tokio::spawn(async move {
         if let Err(e) = server(endpoint, client_public_key).await {
@@ -94,10 +95,14 @@ async fn client(
 }
 
 /// Creates a server endpoint
-fn server_endpoint(keypair: x25519_dalek::StaticSecret) -> (SocketAddr, quinn::Endpoint) {
+fn server_endpoint(
+    keypair: x25519_dalek::StaticSecret,
+    remote_public_key: x25519_dalek::PublicKey,
+) -> (SocketAddr, quinn::Endpoint) {
     let crypto = Arc::new(quinn_noise::NoiseServerConfig {
         keypair,
         supported_protocols: vec![b"test1".to_vec(), b"test2".to_vec()],
+        remote_public_key_verifier: Arc::new(Verifier([remote_public_key].into_iter().collect())),
     });
 
     let server_config = quinn::ServerConfig::with_crypto(crypto);
@@ -145,4 +150,11 @@ pub async fn connect_client(
     assert_eq!(data.alpn, b"test1");
 
     Ok((endpoint, connection))
+}
+
+pub struct Verifier(HashSet<PublicKey>);
+impl PublicKeyVerifier for Verifier {
+    fn verify(&self, key: &x25519_dalek::PublicKey) -> bool {
+        self.0.contains(key)
+    }
 }

@@ -8,7 +8,7 @@ use x25519_dalek::PublicKey;
 use zeroize::Zeroizing;
 
 use crate::noise_impl::{HandshakeState, HandshakeStateBuilder, Sensitive};
-use crate::NoiseServerConfig;
+use crate::{NoiseServerConfig, PublicKeyVerifier};
 
 use super::{
     client_server, connection_refused, handshake_pattern, initial_keys, noise_error, split,
@@ -38,7 +38,12 @@ impl ServerConfig for NoiseServerConfig {
         let state = state.build_handshake_state();
 
         Box::new(NoiseSession {
-            state: Ok(Box::new(ServerInitial { state })),
+            state: Ok(Box::new(ServerInitial {
+                state: InnerState {
+                    state,
+                    remote_public_key_verifier: self.remote_public_key_verifier.clone(),
+                },
+            })),
             data: CommonData {
                 requested_protocols: vec![],
                 supported_protocols: self.supported_protocols.clone(),
@@ -78,22 +83,27 @@ impl ServerConfig for NoiseServerConfig {
     }
 }
 
+struct InnerState {
+    state: HandshakeState,
+    remote_public_key_verifier: Arc<dyn PublicKeyVerifier>,
+}
+
 #[derive(TransparentWrapper)]
 #[repr(transparent)]
 struct ServerInitial {
-    state: HandshakeState,
+    state: InnerState,
 }
 
 #[derive(TransparentWrapper)]
 #[repr(transparent)]
 struct ServerZeroRTT {
-    state: HandshakeState,
+    state: InnerState,
 }
 
 #[derive(TransparentWrapper)]
 #[repr(transparent)]
 struct ServerHandshake {
-    state: HandshakeState,
+    state: InnerState,
 }
 
 impl State for ServerInitial {
@@ -104,10 +114,22 @@ impl State for ServerInitial {
     ) -> Result<Box<dyn State>, TransportError> {
         let trailing = self
             .state
+            .state
             .read_message_vec(handshake)
             .map_err(noise_error)?;
 
-        data.remote_s = self.state.get_rs().map(PublicKey::from);
+        let rs = self
+            .state
+            .state
+            .get_rs()
+            .expect("IK pattern has s in the client initial handshake message");
+        let rs = PublicKey::from(rs);
+
+        if !self.state.remote_public_key_verifier.verify(&rs) {
+            return Err(connection_refused("client not authorized"));
+        }
+
+        data.remote_s = Some(rs);
 
         // alpn
         let (&[len], rest) = split_n(&trailing)?;
@@ -156,7 +178,7 @@ impl State for ServerZeroRTT {
         _data: &CommonData,
         _handshake: &mut Vec<u8>,
     ) -> (Box<dyn State>, Option<KeyPair<Sensitive<[u8; 32]>>>) {
-        let keys = server_keys(&self.state);
+        let keys = server_keys(&self.state.state);
 
         (
             ServerHandshake::wrap_box(ServerZeroRTT::peel_box(self)),
@@ -182,13 +204,13 @@ impl State for ServerHandshake {
 
         data.transport_parameters.write(&mut payload);
 
-        let overhead = self.state.get_next_message_overhead();
+        let overhead = self.state.state.get_next_message_overhead();
         handshake.resize(overhead + payload.len(), 0);
-        self.state.write_message(&payload, handshake).unwrap();
+        self.state.state.write_message(&payload, handshake).unwrap();
 
         let mut data = Data {
-            hash: self.state.get_hash().try_into().unwrap(),
-            keys: server_keys(&self.state),
+            hash: self.state.state.get_hash().try_into().unwrap(),
+            keys: server_keys(&self.state.state),
         };
 
         let keys = data.next_keys();

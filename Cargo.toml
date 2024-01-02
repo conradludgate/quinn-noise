@@ -2,7 +2,7 @@
 name = "quinn-noise"
 version = "0.4.0"
 authors = ["David Craven <david@craven.ch>"]
-edition = "2018"
+edition = "2021"
 description = "quinn noise implementation."
 repository = "https://github.com/ipfs-rust/quinn-noise"
 license = "MIT OR Apache-2.0"

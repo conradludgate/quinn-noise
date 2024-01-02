@@ -1,6 +1,6 @@
 use bytemuck::{TransparentWrapper, TransparentWrapperAlloc};
 use noise_protocol::HandshakeStateBuilder;
-use quinn_proto::crypto::{ClientConfig, KeyPair, PacketKey, Session};
+use quinn_proto::crypto::{ClientConfig, KeyPair, Session};
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, Side, TransportError};
 use std::convert::TryInto;
@@ -106,10 +106,6 @@ impl State for ClientInitial {
 }
 
 impl State for ClientHandshake {
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        None
-    }
-
     fn read_handshake(
         mut self: Box<Self>,
         data: &mut CommonData,

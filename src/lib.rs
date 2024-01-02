@@ -1,6 +1,8 @@
 mod noise_impl;
 mod session;
 
+use std::sync::Arc;
+
 pub use x25519_dalek::{PublicKey, StaticSecret};
 
 // https://github.com/quicwg/base-drafts/wiki/QUIC-Versions
@@ -24,8 +26,16 @@ pub struct NoiseClientConfig {
 pub struct NoiseServerConfig {
     /// Keypair to use.
     pub keypair: StaticSecret,
+
+    /// Verifier for client static public keys
+    pub remote_public_key_verifier: Arc<dyn PublicKeyVerifier>,
+
     /// Supported ALPN identifiers.
     pub supported_protocols: Vec<Vec<u8>>,
+}
+
+pub trait PublicKeyVerifier: 'static + Send + Sync {
+    fn verify(&self, key: &PublicKey) -> bool;
 }
 
 pub struct HandshakeData {

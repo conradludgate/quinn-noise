@@ -9,9 +9,17 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
+use quinn_noise::PublicKeyVerifier;
 use rand_core::OsRng;
 use tokio::runtime::{Builder, Runtime};
 use x25519_dalek::StaticSecret;
+
+pub struct NoVerify;
+impl PublicKeyVerifier for NoVerify {
+    fn verify(&self, _key: &x25519_dalek::PublicKey) -> bool {
+        true
+    }
+}
 
 /// Creates a server endpoint which runs on the given runtime
 pub fn server_endpoint(
@@ -22,6 +30,7 @@ pub fn server_endpoint(
     let crypto = Arc::new(quinn_noise::NoiseServerConfig {
         keypair,
         supported_protocols: vec![b"bench".to_vec()],
+        remote_public_key_verifier: Arc::new(NoVerify),
     });
     let mut server_config = quinn::ServerConfig::with_crypto(crypto);
     server_config.transport = Arc::new(transport_config(opt));
