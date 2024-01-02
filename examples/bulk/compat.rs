@@ -1,6 +1,4 @@
 use std::{
-    convert::TryInto,
-    marker::PhantomData,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     num::ParseIntError,
     str::FromStr,
@@ -11,7 +9,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use noise_protocol::DH;
-use noise_protocol_quinn::PublicKeyVerifier;
+use noise_protocol_quinn::{NoiseClientConfig, NoiseServerConfig, PublicKeyVerifier};
 use noise_ring::ChaCha20Poly1305;
 use noise_rust_crypto::{sensitive::Sensitive, Blake2b, X25519};
 use rand_core::OsRng;
@@ -32,16 +30,11 @@ pub fn server_endpoint(
     keypair: StaticSecret,
     opt: &Opt,
 ) -> (SocketAddr, quinn::Endpoint) {
-    let crypto =
-        Arc::new(
-            noise_protocol_quinn::NoiseServerConfig::<X25519, ChaCha20Poly1305, Blake2b> {
-                keypair: Sensitive::from(Zeroizing::new(keypair.to_bytes())),
-                supported_protocols: vec![b"bench".to_vec()],
-                remote_public_key_verifier: Arc::new(NoVerify),
-                algs: PhantomData,
-            },
-        );
-    let mut server_config = quinn::ServerConfig::with_crypto(crypto);
+    let crypto = NoiseServerConfig::<X25519, ChaCha20Poly1305, Blake2b>::builder(&[])
+        .set_static_key(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
+        .build();
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport = Arc::new(transport_config(opt));
 
     let endpoint = {
@@ -65,12 +58,10 @@ pub async fn connect_client(
     let endpoint =
         quinn::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
     let keypair = StaticSecret::random_from_rng(OsRng);
-    let crypto = noise_protocol_quinn::NoiseClientConfig::<X25519, ChaCha20Poly1305, Blake2b> {
-        remote_public_key: remote_public_key.to_bytes(),
-        requested_protocols: vec![b"bench".to_vec()],
-        keypair: Sensitive::from(Zeroizing::new(keypair.to_bytes())),
-        algs: PhantomData,
-    };
+    let crypto = NoiseClientConfig::<X25519, ChaCha20Poly1305, Blake2b>::builder(&[])
+        .set_static_key(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
+        .set_remote_public_key(remote_public_key.to_bytes())
+        .build();
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
     client_config.transport_config(Arc::new(transport_config(&opt)));

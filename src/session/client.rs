@@ -1,5 +1,5 @@
 use bytemuck::{TransparentWrapper, TransparentWrapperAlloc};
-use noise_protocol::{Cipher, HandshakeState, HandshakeStateBuilder, Hash, U8Array, DH};
+use noise_protocol::{Cipher, HandshakeState, Hash, U8Array, DH};
 use quinn_proto::crypto::{ClientConfig, KeyPair, Session};
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, Side, TransportError};
@@ -9,8 +9,8 @@ use std::sync::Arc;
 use crate::NoiseClientConfig;
 
 use super::{
-    client_server, connection_refused, handshake_pattern, noise_error, split, split_n, CommonData,
-    Data, NoiseSession, State,
+    client_server, connection_refused, noise_error, split, split_n, CommonData, Data, NoiseSession,
+    State,
 };
 
 fn client_keys<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> KeyPair<C::Key> {
@@ -35,23 +35,17 @@ where
         _server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn Session>, ConnectError> {
-        let mut state = HandshakeStateBuilder::<D>::new();
-        state
-            .set_pattern(handshake_pattern::<D, C, H>())
-            .set_prologue(&[])
-            .set_s(self.keypair.clone())
-            .set_rs(self.remote_public_key.clone())
-            .set_is_initiator(true);
-        let state = state.build_handshake_state::<C, H>();
-
+        let remote_s = self.state.get_rs();
         Ok(Box::new(NoiseSession::<D, C, H> {
-            state: Ok(Box::new(ClientInitial { state })),
+            state: Ok(Box::new(ClientInitial {
+                state: self.state.clone(),
+            })),
             data: CommonData {
                 requested_protocols: self.requested_protocols.clone(),
                 supported_protocols: vec![],
                 transport_parameters: *params,
                 remote_transport_parameters: None,
-                remote_s: Some(self.remote_public_key.clone()),
+                remote_s,
             },
             hash: PhantomData,
         }))

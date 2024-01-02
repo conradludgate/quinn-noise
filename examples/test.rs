@@ -1,13 +1,14 @@
 use std::{
     collections::HashSet,
-    marker::PhantomData,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
 
 use anyhow::{ensure, Context, Result};
 use noise_protocol::DH;
-use noise_protocol_quinn::{HandshakeData, PublicKeyVerifier};
+use noise_protocol_quinn::{
+    HandshakeData, NoiseClientConfig, NoiseServerConfig, PublicKeyVerifier,
+};
 use noise_ring::ChaCha20Poly1305;
 use noise_rust_crypto::{sensitive::Sensitive, Blake2b, X25519};
 use rand_core::OsRng;
@@ -104,18 +105,16 @@ fn server_endpoint(
     keypair: x25519_dalek::StaticSecret,
     remote_public_key: x25519_dalek::PublicKey,
 ) -> (SocketAddr, quinn::Endpoint) {
-    let crypto = Arc::new(noise_protocol_quinn::NoiseServerConfig::<
-        X25519,
-        ChaCha20Poly1305,
-        Blake2b,
-    > {
-        keypair: Sensitive::from(Zeroizing::new(keypair.to_bytes())),
-        supported_protocols: vec![b"test1".to_vec(), b"test2".to_vec()],
-        remote_public_key_verifier: Arc::new(Verifier([remote_public_key].into_iter().collect())),
-        algs: PhantomData,
-    });
+    let crypto = NoiseServerConfig::<X25519, ChaCha20Poly1305, Blake2b>::builder(&[])
+        .set_static_key(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
+        .set_key_verifier(Arc::new(Verifier(
+            [remote_public_key].into_iter().collect(),
+        )))
+        .push_supported_protocol(b"test1".to_vec())
+        .push_supported_protocol(b"test2".to_vec())
+        .build();
 
-    let server_config = quinn::ServerConfig::with_crypto(crypto);
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let endpoint = quinn::Endpoint::server(server_config, socket).unwrap();
 
@@ -129,12 +128,13 @@ pub async fn connect_client(
     keypair: x25519_dalek::StaticSecret,
     remote_public_key: x25519_dalek::PublicKey,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    let crypto = noise_protocol_quinn::NoiseClientConfig::<X25519, ChaCha20Poly1305, Blake2b> {
-        remote_public_key: remote_public_key.to_bytes(),
-        requested_protocols: vec![b"test3".to_vec(), b"test1".to_vec(), b"test2".to_vec()],
-        keypair: Sensitive::from(Zeroizing::new(keypair.to_bytes())),
-        algs: PhantomData,
-    };
+    let crypto = NoiseClientConfig::<X25519, ChaCha20Poly1305, Blake2b>::builder(&[])
+        .set_static_key(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
+        .set_remote_public_key(remote_public_key.to_bytes())
+        .push_requested_protocol(b"test3".to_vec())
+        .push_requested_protocol(b"test1".to_vec())
+        .push_requested_protocol(b"test2".to_vec())
+        .build();
 
     let client_config = quinn::ClientConfig::new(Arc::new(crypto));
     let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);

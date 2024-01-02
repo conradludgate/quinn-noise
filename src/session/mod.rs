@@ -1,4 +1,3 @@
-use noise_protocol::patterns::{HandshakePattern, Token};
 use noise_protocol::{Cipher, HandshakeState, Hash, U8Array, DH};
 use quinn_proto::crypto::{
     ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, Session,
@@ -18,24 +17,6 @@ mod client;
 mod packet_key;
 mod server;
 
-fn handshake_pattern<D: DH, C: Cipher, H: Hash>() -> HandshakePattern {
-    let name = String::leak(format!(
-        "Noise_IK_{}_{}_{}",
-        D::name(),
-        C::name(),
-        H::name()
-    ));
-
-    HandshakePattern::new(
-        &[],
-        &[Token::S],
-        &[
-            &[Token::E, Token::ES, Token::S, Token::SS],
-            &[Token::E, Token::EE, Token::SE],
-        ],
-        name,
-    )
-}
 
 fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
     struct PlaintextHeaderKey;
