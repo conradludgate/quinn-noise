@@ -8,7 +8,10 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use noise_protocol_quinn::{NoiseClientConfig, NoiseServerConfig};
+use noise_protocol_quinn::{
+    noise_protocol::{patterns::noise_ik, HandshakeStateBuilder},
+    NoiseConfig,
+};
 use noise_ring::ChaCha20Poly1305;
 use noise_rust_crypto::{sensitive::Sensitive, Blake2b, X25519};
 use rand_core::OsRng;
@@ -22,9 +25,14 @@ pub fn server_endpoint(
     keypair: StaticSecret,
     opt: &Opt,
 ) -> (SocketAddr, quinn::Endpoint) {
-    let crypto = NoiseServerConfig::<X25519, ChaCha20Poly1305, Blake2b>::builder(&[])
-        .set_static_key(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
-        .build();
+    let mut handshake = HandshakeStateBuilder::<X25519>::new();
+    handshake
+        .set_prologue(&[])
+        .set_pattern(noise_ik())
+        .set_is_initiator(false)
+        .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())));
+    let handshake = handshake.build_handshake_state::<ChaCha20Poly1305, Blake2b>();
+    let crypto = NoiseConfig::new(handshake, vec![]);
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport = Arc::new(transport_config(opt));
@@ -50,10 +58,16 @@ pub async fn connect_client(
     let endpoint =
         quinn::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
     let keypair = StaticSecret::random_from_rng(OsRng);
-    let crypto = NoiseClientConfig::<X25519, ChaCha20Poly1305, Blake2b>::builder(&[])
-        .set_static_key(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
-        .set_remote_public_key(remote_public_key.to_bytes())
-        .build();
+
+    let mut handshake = HandshakeStateBuilder::<X25519>::new();
+    handshake
+        .set_prologue(&[])
+        .set_pattern(noise_ik())
+        .set_is_initiator(true)
+        .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
+        .set_rs(remote_public_key.to_bytes());
+    let handshake = handshake.build_handshake_state::<ChaCha20Poly1305, Blake2b>();
+    let crypto = NoiseConfig::new(handshake, vec![]);
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
     client_config.transport_config(Arc::new(transport_config(&opt)));

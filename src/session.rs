@@ -10,11 +10,7 @@ use subtle::ConstantTimeEq;
 
 use crate::HandshakeData;
 
-use self::packet_key::PacketKeyWrapper;
-
-mod client;
-mod packet_key;
-mod server;
+use crate::packet_key::PacketKeyWrapper;
 
 fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
     struct PlaintextHeaderKey;
@@ -44,7 +40,9 @@ where
     }
 }
 
-fn initial_keys<D: DH, C: Cipher + 'static, H: Hash>(state: &HandshakeState<D, C, H>) -> Keys
+pub(crate) fn initial_keys<D: DH, C: Cipher + 'static, H: Hash>(
+    state: &HandshakeState<D, C, H>,
+) -> Keys
 where
     C::Key: 'static + Send,
 {
@@ -65,11 +63,11 @@ fn client_server<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> 
     (client, server)
 }
 
-struct InnerHandshakeState<D: DH, C: Cipher, H: Hash> {
-    state: HandshakeState<D, C, H>,
+pub(crate) struct InnerHandshakeState<D: DH, C: Cipher, H: Hash> {
+    pub(crate) state: HandshakeState<D, C, H>,
     // a little bit annoying that neither snow nor noise-protocol expose this field directly
-    pattern: usize,
-    needs_keys: bool,
+    pub(crate) pattern: usize,
+    pub(crate) needs_keys: bool,
 }
 
 fn keys<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> KeyPair<<C as Cipher>::Key> {
@@ -99,7 +97,7 @@ impl<D: DH, C: Cipher, H: Hash> InnerHandshakeState<D, C, H> {
     }
 }
 
-struct Data<C: Cipher, H: Hash> {
+pub(crate) struct Data<C: Cipher, H: Hash> {
     keys: KeyPair<C::Key>,
     hash: H::Output,
 }
@@ -116,23 +114,19 @@ impl<C: Cipher, H: Hash> Data<C, H> {
     }
 }
 
-enum State<D: DH, C: Cipher, H: Hash> {
+pub(crate) enum State<D: DH, C: Cipher, H: Hash> {
     Handshaking(Box<InnerHandshakeState<D, C, H>>),
     Complete(Data<C, H>),
 }
 
-struct NoiseSession<D: DH, C: Cipher, H: Hash> {
-    state: State<D, C, H>,
-    data: CommonData<D>,
-    integrity_key: H::Output,
-}
-
-struct CommonData<D: DH> {
-    negotiated_protocol: Option<Vec<u8>>,
-    supported_protocols: Vec<Vec<u8>>,
-    transport_parameters: TransportParameters,
-    remote_transport_parameters: Option<TransportParameters>,
-    remote_s: Option<D::Pubkey>,
+pub(crate) struct NoiseSession<D: DH, C: Cipher, H: Hash> {
+    pub(crate) state: State<D, C, H>,
+    pub(crate) negotiated_protocol: Option<Vec<u8>>,
+    pub(crate) supported_protocols: Vec<Vec<u8>>,
+    pub(crate) transport_parameters: TransportParameters,
+    pub(crate) remote_transport_parameters: Option<TransportParameters>,
+    pub(crate) remote_s: Option<D::Pubkey>,
+    pub(crate) integrity_key: H::Output,
 }
 
 fn connection_refused(reason: &str) -> TransportError {
@@ -171,7 +165,9 @@ fn noise_error(e: noise_protocol::Error) -> TransportError {
     }
 }
 
-pub fn get_integrity_key<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> H::Output {
+pub(crate) fn get_integrity_key<D: DH, C: Cipher, H: Hash>(
+    state: &HandshakeState<D, C, H>,
+) -> H::Output {
     // same seed as QUIC-TLS <https://www.rfc-editor.org/rfc/rfc9001.html#name-retry-packet-integrity>
     // > The secret key and the nonce are values derived by calling HKDF-Expand-Label using
     // > 0xd9c9943e6101fd200021506bcc02814c73030f25c79d71ce876eca876e6fca8e as the secret,
@@ -233,35 +229,34 @@ where
         inner.pattern += 1;
         inner.needs_keys = true;
 
-        self.data.remote_s = inner.state.get_rs();
+        self.remote_s = inner.state.get_rs();
 
         if !inner.state.get_is_initiator() && inner.connection_parameters_request() {
             // alpn
             let (&[len], rest) = split_n(&payload)?;
             let (mut alpns, mut transport_params) = split(rest, len as usize)?;
 
-            if !self.data.supported_protocols.is_empty() {
+            if !self.supported_protocols.is_empty() {
                 while !alpns.is_empty() {
                     let (&[len], next) = split_n(alpns)?;
                     let (alpn, next_alpn) = split(next, len as usize)?;
                     alpns = next_alpn;
                     let found = self
-                        .data
                         .supported_protocols
                         .iter()
                         .any(|proto| proto.as_slice() == alpn);
 
                     if found {
-                        self.data.negotiated_protocol = Some(alpn.to_vec());
+                        self.negotiated_protocol = Some(alpn.to_vec());
                         break;
                     }
                 }
-                if self.data.negotiated_protocol.is_none() {
+                if self.negotiated_protocol.is_none() {
                     return Err(connection_refused("unsupported alpn"));
                 }
             }
 
-            self.data.remote_transport_parameters = Some(TransportParameters::read(
+            self.remote_transport_parameters = Some(TransportParameters::read(
                 Side::Server,
                 &mut transport_params,
             )?);
@@ -271,20 +266,18 @@ where
             // alpn
             let (&[len], rest) = split_n(&payload)?;
             let (alpn, mut transport_params) = split(rest, len as usize)?;
-            self.data.negotiated_protocol =
-                self.data.supported_protocols.drain(..).find(|p| p == alpn);
-            if !self.data.supported_protocols.is_empty() && self.data.negotiated_protocol.is_none()
-            {
+            self.negotiated_protocol = self.supported_protocols.drain(..).find(|p| p == alpn);
+            if !self.supported_protocols.is_empty() && self.negotiated_protocol.is_none() {
                 return Err(connection_refused("unsupported alpn"));
             }
 
-            self.data.remote_transport_parameters = Some(TransportParameters::read(
+            self.remote_transport_parameters = Some(TransportParameters::read(
                 Side::Client,
                 &mut transport_params,
             )?);
         }
 
-        Ok(self.data.negotiated_protocol.is_some())
+        Ok(self.negotiated_protocol.is_some())
     }
 
     fn write_handshake(&mut self, handshake: &mut Vec<u8>) -> Option<Keys> {
@@ -326,28 +319,27 @@ where
         if inner.state.get_is_initiator() && inner.connection_parameters_request() {
             // alpn
             let len = self
-                .data
                 .supported_protocols
                 .iter()
                 .map(|s| s.len() as u8 + 1)
                 .sum::<u8>();
             payload.extend_from_slice(&len.to_le_bytes());
-            for alpn in &self.data.supported_protocols {
+            for alpn in &self.supported_protocols {
                 payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
                 payload.extend_from_slice(alpn);
             }
 
-            self.data.transport_parameters.write(&mut payload);
+            self.transport_parameters.write(&mut payload);
         }
 
         if !inner.state.get_is_initiator() && inner.connection_parameters_response() {
             // alpn
-            if let Some(alpn) = &self.data.negotiated_protocol {
+            if let Some(alpn) = &self.negotiated_protocol {
                 payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
                 payload.extend_from_slice(alpn);
             }
 
-            self.data.transport_parameters.write(&mut payload);
+            self.transport_parameters.write(&mut payload);
         }
 
         let overhead = inner.state.get_next_message_overhead();
@@ -377,20 +369,19 @@ where
     }
 
     fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        Some(Box::new(self.data.remote_s.as_ref()?.clone()))
+        Some(Box::new(self.remote_s.as_ref()?.clone()))
     }
 
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
         Ok(Some(
-            self.data
-                .remote_transport_parameters
-                .unwrap_or(self.data.transport_parameters),
+            self.remote_transport_parameters
+                .unwrap_or(self.transport_parameters),
         ))
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
         Some(Box::new(HandshakeData {
-            alpn: self.data.negotiated_protocol.clone()?,
+            alpn: self.negotiated_protocol.clone()?,
         }))
     }
 
