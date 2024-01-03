@@ -44,16 +44,13 @@ where
     }
 }
 
-fn initial_keys<C: Cipher + 'static>() -> Keys
+fn initial_keys<D: DH, C: Cipher + 'static, H: Hash>(state: &HandshakeState<D, C, H>) -> Keys
 where
     C::Key: 'static + Send,
 {
     Keys {
         header: header_keypair(),
-        packet: packet_keys::<C>(KeyPair {
-            local: C::Key::new(),
-            remote: C::Key::new(),
-        }),
+        packet: packet_keys::<C>(keys(state)),
     }
 }
 
@@ -75,6 +72,21 @@ struct InnerHandshakeState<D: DH, C: Cipher, H: Hash> {
     needs_keys: bool,
 }
 
+fn keys<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> KeyPair<<C as Cipher>::Key> {
+    let (client, server) = client_server(state);
+    if state.get_is_initiator() {
+        KeyPair {
+            local: client,
+            remote: server,
+        }
+    } else {
+        KeyPair {
+            local: server,
+            remote: client,
+        }
+    }
+}
+
 impl<D: DH, C: Cipher, H: Hash> InnerHandshakeState<D, C, H> {
     fn connection_parameters_request(&self) -> bool {
         self.pattern + 3 >= self.state.get_pattern().get_message_patterns_len()
@@ -83,18 +95,7 @@ impl<D: DH, C: Cipher, H: Hash> InnerHandshakeState<D, C, H> {
         self.pattern + 2 >= self.state.get_pattern().get_message_patterns_len()
     }
     fn keys(&self) -> KeyPair<<C as Cipher>::Key> {
-        let (client, server) = client_server(&self.state);
-        if self.state.get_is_initiator() {
-            KeyPair {
-                local: client,
-                remote: server,
-            }
-        } else {
-            KeyPair {
-                local: server,
-                remote: client,
-            }
-        }
+        keys(&self.state)
     }
 }
 
@@ -195,7 +196,10 @@ where
     H::Output: 'static + Send + Sync,
 {
     fn initial_keys(&self, _dst_cid: &ConnectionId, _side: Side) -> Keys {
-        initial_keys::<C>()
+        match &self.state {
+            State::Handshaking(inner) => initial_keys(&inner.state),
+            State::Complete(_) => unreachable!(),
+        }
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {

@@ -44,7 +44,7 @@ where
         _dst_cid: &ConnectionId,
         _side: Side,
     ) -> Result<Keys, quinn_proto::crypto::UnsupportedVersion> {
-        Ok(initial_keys::<C>())
+        Ok(initial_keys(&self.state))
     }
 
     fn retry_tag(&self, _version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
