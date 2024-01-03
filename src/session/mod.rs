@@ -102,6 +102,21 @@ fn client_server<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> 
     (client, server)
 }
 
+struct InnerHandshakeState<D: DH, C: Cipher, H: Hash> {
+    state: HandshakeState<D, C, H>,
+    // a little bit annoying that neither snow nor noise-protocol expose this field directly
+    pattern: usize,
+}
+
+impl<D: DH, C: Cipher, H: Hash> InnerHandshakeState<D, C, H> {
+    fn connection_parameters_request(&self) -> bool {
+        self.pattern + 3 >= self.state.get_pattern().get_message_patterns_len()
+    }
+    fn connection_parameters_response(&self) -> bool {
+        self.pattern + 2 >= self.state.get_pattern().get_message_patterns_len()
+    }
+}
+
 struct Data<C: Cipher, H: Hash> {
     keys: KeyPair<C::Key>,
     hash: H::Output,

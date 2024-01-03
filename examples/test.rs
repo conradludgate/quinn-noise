@@ -1,19 +1,14 @@
 use std::{
-    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::Arc,
 };
 
 use anyhow::{ensure, Context, Result};
 use noise_protocol::DH;
-use noise_protocol_quinn::{
-    HandshakeData, NoiseClientConfig, NoiseServerConfig, PublicKeyVerifier,
-};
-use noise_ring::ChaCha20Poly1305;
-use noise_rust_crypto::{sensitive::Sensitive, Blake2b, X25519};
+use noise_protocol_quinn::{HandshakeData, NoiseClientConfig, NoiseServerConfig};
+use noise_rust_crypto::{sensitive::Sensitive, Blake2b, ChaCha20Poly1305, X25519};
 use quinn::TokioRuntime;
 use rand_core::OsRng;
-use x25519_dalek::PublicKey;
 use zeroize::Zeroizing;
 
 /// You must use a different version. 0x00000000 - 0x0000ffff is reserved.
@@ -28,7 +23,7 @@ async fn main() {
     let client_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let client_public_key = x25519_dalek::PublicKey::from(&client_secret_key);
 
-    let (server_addr, endpoint) = server_endpoint(server_secret_key, client_public_key);
+    let (server_addr, endpoint) = server_endpoint(server_secret_key);
 
     tokio::spawn(async move {
         if let Err(e) = server(endpoint, client_public_key).await {
@@ -117,15 +112,9 @@ fn new_endpoint(server_config: Option<quinn::ServerConfig>) -> std::io::Result<q
 }
 
 /// Creates a server endpoint
-fn server_endpoint(
-    keypair: x25519_dalek::StaticSecret,
-    remote_public_key: x25519_dalek::PublicKey,
-) -> (SocketAddr, quinn::Endpoint) {
+fn server_endpoint(keypair: x25519_dalek::StaticSecret) -> (SocketAddr, quinn::Endpoint) {
     let crypto = NoiseServerConfig::<X25519, ChaCha20Poly1305, Blake2b>::builder(&[])
         .set_static_key(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
-        .set_key_verifier(Arc::new(Verifier(
-            [remote_public_key].into_iter().collect(),
-        )))
         .push_supported_protocol(b"test1".to_vec())
         .push_supported_protocol(b"test2".to_vec())
         .build();
@@ -177,11 +166,4 @@ pub async fn connect_client(
     assert_eq!(data.alpn, b"test1");
 
     Ok((endpoint, connection))
-}
-
-pub struct Verifier(HashSet<PublicKey>);
-impl PublicKeyVerifier<X25519> for Verifier {
-    fn verify(&self, key: &<X25519 as DH>::Pubkey) -> bool {
-        self.0.contains(&x25519_dalek::PublicKey::from(*key))
-    }
 }

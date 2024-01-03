@@ -6,11 +6,11 @@ use quinn_proto::{ConnectionId, Side, TransportError};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::{NoiseServerConfig, PublicKeyVerifier};
+use crate::NoiseServerConfig;
 
 use super::{
     client_server, connection_refused, initial_keys, noise_error, split, split_n, CommonData, Data,
-    NoiseSession, State, RETRY_INTEGRITY_KEY, RETRY_INTEGRITY_NONCE,
+    InnerHandshakeState, NoiseSession, State, RETRY_INTEGRITY_KEY, RETRY_INTEGRITY_NONCE,
 };
 
 fn server_keys<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> KeyPair<C::Key> {
@@ -35,10 +35,10 @@ where
         params: &TransportParameters,
     ) -> Box<dyn Session> {
         Box::new(NoiseSession::<D, C, H> {
-            state: Ok(Box::new(ServerInitial {
-                state: InnerState {
+            state: Ok(Box::new(ServerRead {
+                inner: InnerHandshakeState {
                     state: self.state.clone(),
-                    remote_public_key_verifier: self.remote_public_key_verifier.clone(),
+                    pattern: 0,
                 },
             })),
             data: CommonData {
@@ -81,30 +81,25 @@ where
     }
 }
 
-struct InnerState<D: DH, C: Cipher, H: Hash> {
-    state: HandshakeState<D, C, H>,
-    remote_public_key_verifier: Arc<dyn PublicKeyVerifier<D>>,
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
+struct ServerRead<D: DH, C: Cipher, H: Hash> {
+    inner: InnerHandshakeState<D, C, H>,
 }
 
 #[derive(TransparentWrapper)]
 #[repr(transparent)]
-struct ServerInitial<D: DH, C: Cipher, H: Hash> {
-    state: InnerState<D, C, H>,
+struct ServerKeys<D: DH, C: Cipher, H: Hash> {
+    inner: InnerHandshakeState<D, C, H>,
 }
 
 #[derive(TransparentWrapper)]
 #[repr(transparent)]
-struct ServerZeroRTT<D: DH, C: Cipher, H: Hash> {
-    state: InnerState<D, C, H>,
+struct ServerWrite<D: DH, C: Cipher, H: Hash> {
+    inner: InnerHandshakeState<D, C, H>,
 }
 
-#[derive(TransparentWrapper)]
-#[repr(transparent)]
-struct ServerHandshake<D: DH, C: Cipher, H: Hash> {
-    state: InnerState<D, C, H>,
-}
-
-impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C> for ServerInitial<D, C, H>
+impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C> for ServerRead<D, C, H>
 where
     D::Pubkey: 'static + Send + Sync,
     D::Key: 'static + Send + Sync,
@@ -116,54 +111,49 @@ where
         data: &mut CommonData<D>,
         handshake: &[u8],
     ) -> Result<Box<dyn State<D, C>>, TransportError> {
+        debug_assert!(!self.inner.state.is_write_turn());
+
         let trailing = self
-            .state
+            .inner
             .state
             .read_message_vec(handshake)
             .map_err(noise_error)?;
+        self.inner.pattern += 1;
 
-        let rs = self
-            .state
-            .state
-            .get_rs()
-            .expect("IK pattern has s in the client initial handshake message");
+        data.remote_s = self.inner.state.get_rs();
 
-        if !self.state.remote_public_key_verifier.verify(&rs) {
-            return Err(connection_refused("client not authorized"));
-        }
+        if self.inner.connection_parameters_request() {
+            // alpn
+            let (&[len], rest) = split_n(&trailing)?;
+            let (mut alpns, mut transport_params) = split(rest, len as usize)?;
 
-        data.remote_s = Some(rs);
+            if !data.supported_protocols.is_empty() {
+                while !alpns.is_empty() {
+                    let (&[len], next) = split_n(alpns)?;
+                    let (alpn, next_alpn) = split(next, len as usize)?;
+                    alpns = next_alpn;
+                    let found = data
+                        .supported_protocols
+                        .iter()
+                        .any(|proto| proto.as_slice() == alpn);
 
-        // alpn
-        let (&[len], rest) = split_n(&trailing)?;
-        let (mut alpns, mut transport_params) = split(rest, len as usize)?;
-
-        if !data.supported_protocols.is_empty() {
-            while !alpns.is_empty() {
-                let (&[len], next) = split_n(alpns)?;
-                let (alpn, next_alpn) = split(next, len as usize)?;
-                alpns = next_alpn;
-                let found = data
-                    .supported_protocols
-                    .iter()
-                    .any(|proto| proto.as_slice() == alpn);
-
-                if found {
-                    data.requested_protocols.push(alpn.to_vec());
-                    break;
+                    if found {
+                        data.requested_protocols.push(alpn.to_vec());
+                        break;
+                    }
+                }
+                if data.requested_protocols.is_empty() {
+                    return Err(connection_refused("unsupported alpn"));
                 }
             }
-            if data.requested_protocols.is_empty() {
-                return Err(connection_refused("unsupported alpn"));
-            }
+
+            data.remote_transport_parameters = Some(TransportParameters::read(
+                Side::Server,
+                &mut transport_params,
+            )?);
         }
 
-        data.remote_transport_parameters = Some(TransportParameters::read(
-            Side::Server,
-            &mut transport_params,
-        )?);
-
-        Ok(ServerZeroRTT::wrap_box(ServerInitial::peel_box(self)))
+        Ok(ServerKeys::wrap_box(Self::peel_box(self)))
     }
 
     fn write_handshake(
@@ -175,7 +165,7 @@ where
     }
 }
 
-impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C> for ServerZeroRTT<D, C, H>
+impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C> for ServerKeys<D, C, H>
 where
     D::Pubkey: 'static + Send + Sync,
     D::Key: 'static + Send + Sync,
@@ -187,17 +177,23 @@ where
         _data: &CommonData<D>,
         _handshake: &mut Vec<u8>,
     ) -> (Box<dyn State<D, C>>, Option<KeyPair<C::Key>>) {
-        let keys = server_keys(&self.state.state);
+        let keys = server_keys(&self.inner.state);
 
-        (
-            ServerHandshake::wrap_box(ServerZeroRTT::peel_box(self)),
-            Some(keys),
-        )
+        if self.inner.state.completed() {
+            let mut data = Data::<C, H> {
+                hash: H::Output::from_slice(self.inner.state.get_hash()),
+                keys,
+            };
+
+            let keys = data.next_keys();
+            (Box::new(data), Some(keys))
+        } else {
+            (ServerWrite::wrap_box(Self::peel_box(self)), Some(keys))
+        }
     }
 }
 
-impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C>
-    for ServerHandshake<D, C, H>
+impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C> for ServerWrite<D, C, H>
 where
     D::Pubkey: 'static + Send + Sync,
     D::Key: 'static + Send + Sync,
@@ -209,27 +205,38 @@ where
         data: &CommonData<D>,
         handshake: &mut Vec<u8>,
     ) -> (Box<dyn State<D, C>>, Option<KeyPair<C::Key>>) {
+        debug_assert!(self.inner.state.is_write_turn());
+
         // payload
         let mut payload = vec![];
 
-        // alpn
-        if let [alpn] = &*data.requested_protocols {
-            payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
-            payload.extend_from_slice(alpn);
+        if self.inner.connection_parameters_response() {
+            // alpn
+            if let [alpn] = &*data.requested_protocols {
+                payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
+                payload.extend_from_slice(alpn);
+            }
+
+            data.transport_parameters.write(&mut payload);
         }
 
-        data.transport_parameters.write(&mut payload);
-
-        let overhead = self.state.state.get_next_message_overhead();
+        let overhead = self.inner.state.get_next_message_overhead();
         handshake.resize(overhead + payload.len(), 0);
-        self.state.state.write_message(&payload, handshake).unwrap();
 
-        let mut data = Data::<C, H> {
-            hash: H::Output::from_slice(self.state.state.get_hash()),
-            keys: server_keys(&self.state.state),
-        };
+        self.inner.state.write_message(&payload, handshake).unwrap();
+        self.inner.pattern += 1;
 
-        let keys = data.next_keys();
-        (Box::new(data), Some(keys))
+        let keys = server_keys(&self.inner.state);
+        if self.inner.state.completed() {
+            let mut data = Data::<C, H> {
+                hash: H::Output::from_slice(self.inner.state.get_hash()),
+                keys,
+            };
+
+            let keys = data.next_keys();
+            (Box::new(data), Some(keys))
+        } else {
+            (ServerRead::wrap_box(Self::peel_box(self)), Some(keys))
+        }
     }
 }

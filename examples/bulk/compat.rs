@@ -8,21 +8,13 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use noise_protocol::DH;
-use noise_protocol_quinn::{NoiseClientConfig, NoiseServerConfig, PublicKeyVerifier};
+use noise_protocol_quinn::{NoiseClientConfig, NoiseServerConfig};
 use noise_ring::ChaCha20Poly1305;
 use noise_rust_crypto::{sensitive::Sensitive, Blake2b, X25519};
 use rand_core::OsRng;
 use tokio::runtime::{Builder, Runtime};
 use x25519_dalek::StaticSecret;
 use zeroize::Zeroizing;
-
-pub struct NoVerify;
-impl PublicKeyVerifier<X25519> for NoVerify {
-    fn verify(&self, _key: &<X25519 as DH>::Pubkey) -> bool {
-        true
-    }
-}
 
 /// Creates a server endpoint which runs on the given runtime
 pub fn server_endpoint(
