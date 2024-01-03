@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{ensure, Context, Result};
 use noise_protocol_quinn::{
-    noise_protocol::{patterns::noise_ik, HandshakeStateBuilder, DH},
+    noise_protocol::{patterns::noise_ix, HandshakeStateBuilder, DH},
     HandshakeData, NoiseConfig,
 };
 use noise_rust_crypto::{sensitive::Sensitive, Blake2b, ChaCha20Poly1305, X25519};
@@ -118,7 +118,7 @@ fn server_endpoint(keypair: x25519_dalek::StaticSecret) -> (SocketAddr, quinn::E
     let mut handshake = HandshakeStateBuilder::<X25519>::new();
     handshake
         .set_prologue(&[])
-        .set_pattern(noise_ik())
+        .set_pattern(noise_ix())
         .set_is_initiator(false)
         .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())));
     let handshake = handshake.build_handshake_state::<ChaCha20Poly1305, Blake2b>();
@@ -141,10 +141,9 @@ pub async fn connect_client(
     let mut handshake = HandshakeStateBuilder::<X25519>::new();
     handshake
         .set_prologue(&[])
-        .set_pattern(noise_ik())
+        .set_pattern(noise_ix())
         .set_is_initiator(true)
-        .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
-        .set_rs(remote_public_key.to_bytes());
+        .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())));
     let handshake = handshake.build_handshake_state::<ChaCha20Poly1305, Blake2b>();
     let protocols = vec![b"test3".to_vec(), b"test1".to_vec(), b"test2".to_vec()];
     let crypto = NoiseConfig::new(handshake, protocols);

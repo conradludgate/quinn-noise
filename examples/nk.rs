@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{ensure, Context, Result};
 use noise_protocol_quinn::{
-    noise_protocol::{patterns::noise_ik, HandshakeStateBuilder, DH},
+    noise_protocol::{patterns::noise_nk, HandshakeStateBuilder, DH},
     HandshakeData, NoiseConfig,
 };
 use noise_rust_crypto::{sensitive::Sensitive, Blake2b, ChaCha20Poly1305, X25519};
@@ -23,12 +23,11 @@ async fn main() {
     let server_public_key = x25519_dalek::PublicKey::from(&server_secret_key);
 
     let client_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-    let client_public_key = x25519_dalek::PublicKey::from(&client_secret_key);
 
     let (server_addr, endpoint) = server_endpoint(server_secret_key);
 
     tokio::spawn(async move {
-        if let Err(e) = server(endpoint, client_public_key).await {
+        if let Err(e) = server(endpoint).await {
             eprintln!("server failed: {e:#}");
         }
     });
@@ -37,20 +36,13 @@ async fn main() {
     }
 }
 
-async fn server(
-    endpoint: quinn::Endpoint,
-    remote_public_key: x25519_dalek::PublicKey,
-) -> Result<()> {
+async fn server(endpoint: quinn::Endpoint) -> Result<()> {
     loop {
         let handshake = endpoint.accept().await.unwrap();
         let connection = handshake.await.context("handshake failed")?;
 
-        let peer = connection
-            .peer_identity()
-            .unwrap()
-            .downcast::<<X25519 as DH>::Pubkey>()
-            .unwrap();
-        assert_eq!(*peer, remote_public_key.to_bytes());
+        // during NK handshake, the server does not know the client's static key
+        assert!(connection.peer_identity().is_none());
 
         tokio::spawn(async move {
             loop {
@@ -118,7 +110,7 @@ fn server_endpoint(keypair: x25519_dalek::StaticSecret) -> (SocketAddr, quinn::E
     let mut handshake = HandshakeStateBuilder::<X25519>::new();
     handshake
         .set_prologue(&[])
-        .set_pattern(noise_ik())
+        .set_pattern(noise_nk())
         .set_is_initiator(false)
         .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())));
     let handshake = handshake.build_handshake_state::<ChaCha20Poly1305, Blake2b>();
@@ -141,7 +133,7 @@ pub async fn connect_client(
     let mut handshake = HandshakeStateBuilder::<X25519>::new();
     handshake
         .set_prologue(&[])
-        .set_pattern(noise_ik())
+        .set_pattern(noise_nk())
         .set_is_initiator(true)
         .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
         .set_rs(remote_public_key.to_bytes());

@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{ensure, Context, Result};
 use noise_protocol_quinn::{
-    noise_protocol::{patterns::noise_ik, HandshakeStateBuilder, DH},
+    noise_protocol::{patterns::noise_kn, HandshakeStateBuilder, DH},
     HandshakeData, NoiseConfig,
 };
 use noise_rust_crypto::{sensitive::Sensitive, Blake2b, ChaCha20Poly1305, X25519};
@@ -20,19 +20,18 @@ const QUIC_VERSION: u32 = 0xf00dcafe;
 #[tokio::main]
 async fn main() {
     let server_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-    let server_public_key = x25519_dalek::PublicKey::from(&server_secret_key);
 
     let client_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let client_public_key = x25519_dalek::PublicKey::from(&client_secret_key);
 
-    let (server_addr, endpoint) = server_endpoint(server_secret_key);
+    let (server_addr, endpoint) = server_endpoint(server_secret_key, client_public_key);
 
     tokio::spawn(async move {
         if let Err(e) = server(endpoint, client_public_key).await {
             eprintln!("server failed: {e:#}");
         }
     });
-    if let Err(e) = client(server_addr, client_secret_key, server_public_key).await {
+    if let Err(e) = client(server_addr, client_secret_key).await {
         eprintln!("client failed: {e:#}");
     }
 }
@@ -73,12 +72,8 @@ async fn server(
     }
 }
 
-async fn client(
-    server_addr: SocketAddr,
-    keypair: x25519_dalek::StaticSecret,
-    remote_public_key: x25519_dalek::PublicKey,
-) -> Result<()> {
-    let (endpoint, connection) = connect_client(server_addr, keypair, remote_public_key).await?;
+async fn client(server_addr: SocketAddr, keypair: x25519_dalek::StaticSecret) -> Result<()> {
+    let (endpoint, connection) = connect_client(server_addr, keypair).await?;
     let connection = Arc::new(connection);
 
     let (mut send_stream, mut recv_stream) = connection
@@ -114,13 +109,17 @@ fn new_endpoint(server_config: Option<quinn::ServerConfig>) -> std::io::Result<q
 }
 
 /// Creates a server endpoint
-fn server_endpoint(keypair: x25519_dalek::StaticSecret) -> (SocketAddr, quinn::Endpoint) {
+fn server_endpoint(
+    keypair: x25519_dalek::StaticSecret,
+    remote_public_key: x25519_dalek::PublicKey,
+) -> (SocketAddr, quinn::Endpoint) {
     let mut handshake = HandshakeStateBuilder::<X25519>::new();
     handshake
         .set_prologue(&[])
-        .set_pattern(noise_ik())
+        .set_pattern(noise_kn())
         .set_is_initiator(false)
-        .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())));
+        .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
+        .set_rs(remote_public_key.to_bytes());
     let handshake = handshake.build_handshake_state::<ChaCha20Poly1305, Blake2b>();
     let protocols = vec![b"test2".to_vec(), b"test1".to_vec()];
     let crypto = NoiseConfig::new(handshake, protocols);
@@ -136,15 +135,13 @@ fn server_endpoint(keypair: x25519_dalek::StaticSecret) -> (SocketAddr, quinn::E
 pub async fn connect_client(
     server_addr: SocketAddr,
     keypair: x25519_dalek::StaticSecret,
-    remote_public_key: x25519_dalek::PublicKey,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let mut handshake = HandshakeStateBuilder::<X25519>::new();
     handshake
         .set_prologue(&[])
-        .set_pattern(noise_ik())
+        .set_pattern(noise_kn())
         .set_is_initiator(true)
-        .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())))
-        .set_rs(remote_public_key.to_bytes());
+        .set_s(Sensitive::from(Zeroizing::new(keypair.to_bytes())));
     let handshake = handshake.build_handshake_state::<ChaCha20Poly1305, Blake2b>();
     let protocols = vec![b"test3".to_vec(), b"test1".to_vec(), b"test2".to_vec()];
     let crypto = NoiseConfig::new(handshake, protocols);
@@ -160,12 +157,8 @@ pub async fn connect_client(
         .await
         .context("unable to connect")?;
 
-    let peer = connection
-        .peer_identity()
-        .unwrap()
-        .downcast::<<X25519 as DH>::Pubkey>()
-        .unwrap();
-    assert_eq!(*peer, remote_public_key.to_bytes());
+    // during IN handshake, the client does not know the server's static key
+    assert!(connection.peer_identity().is_none());
 
     let data = connection
         .handshake_data()
