@@ -4,7 +4,7 @@ This is a fork of the `ipfs-rust/quinn-noise` project. It is a significant rewri
 
 ## Handshake pattern
 
-`Noise_IK_25519_ChaChaPoly_BLAKE3`.
+`Noise_IK_{DH}_{Cipher}_{Hash}`.
 
 My intended usecase is similar to that of wireguard or SSH. The client will know the server's public key,
 but the server will not know which client to initially expect. Because of this, I am using the `IK` pattern
@@ -22,25 +22,15 @@ IK:
 
 ## QUIC version
 
-I am using `0xf0f0f2f1` as the only valid version number.
-
-Reserved versions for original `quinn-noise` are `0xf0f0f2f[0-f]` [0].
-
-- [0] https://github.com/quicwg/base-drafts/wiki/QUIC-Versions
+Because this is not 1 protocol, but many, I will not provide a QUIC version to use.
+See <https://github.com/quicwg/base-drafts/wiki/QUIC-Versions> for version information.
 
 ## Export Keying Material
 
-The final SymmetricState `h` value is used in a BLAKE3 KDF as such:
+The final SymmetricState `h` value is used as the input keying material to a HKDF.
 
-```rust
-fn export_keying_material(h: &[u8; 32], label: &[u8], context: &[u8], output: &mut [u8]) {
-  blake3::Hasher::new_derive_key("QUIC Noise_IK_25519_ChaChaPoly_BLAKE3 2024-01-01 23:28:47 export keying material")
-    .update(context)
-    .update(h)
-    .update(label)
-    .finalize_xof()
-    .fill(output);
-}
+```
+out = hkdf_expand(h, label || context, out.len())
 ```
 
 ## Header protection

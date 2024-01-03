@@ -17,7 +17,6 @@ mod client;
 mod packet_key;
 mod server;
 
-
 fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
     struct PlaintextHeaderKey;
     impl HeaderKey for PlaintextHeaderKey {

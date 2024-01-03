@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::Arc,
 };
 
@@ -11,9 +11,14 @@ use noise_protocol_quinn::{
 };
 use noise_ring::ChaCha20Poly1305;
 use noise_rust_crypto::{sensitive::Sensitive, Blake2b, X25519};
+use quinn::TokioRuntime;
 use rand_core::OsRng;
 use x25519_dalek::PublicKey;
 use zeroize::Zeroizing;
+
+/// You must use a different version. 0x00000000 - 0x0000ffff is reserved.
+/// See <https://github.com/quicwg/base-drafts/wiki/QUIC-Versions>
+const QUIC_VERSION: u32 = 0xf00dcafe;
 
 #[tokio::main]
 async fn main() {
@@ -100,6 +105,17 @@ async fn client(
     Ok(())
 }
 
+fn new_endpoint(server_config: Option<quinn::ServerConfig>) -> std::io::Result<quinn::Endpoint> {
+    let mut endpoint_config = quinn::EndpointConfig::default();
+    endpoint_config.supported_versions(vec![QUIC_VERSION]);
+
+    let runtime = Arc::new(TokioRuntime);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let socket = UdpSocket::bind(addr).unwrap();
+
+    quinn::Endpoint::new(endpoint_config, server_config, socket, runtime)
+}
+
 /// Creates a server endpoint
 fn server_endpoint(
     keypair: x25519_dalek::StaticSecret,
@@ -115,8 +131,7 @@ fn server_endpoint(
         .build();
 
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let endpoint = quinn::Endpoint::server(server_config, socket).unwrap();
+    let endpoint = new_endpoint(Some(server_config)).unwrap();
 
     let server_addr = endpoint.local_addr().unwrap();
     (server_addr, endpoint)
@@ -136,9 +151,10 @@ pub async fn connect_client(
         .push_requested_protocol(b"test2".to_vec())
         .build();
 
-    let client_config = quinn::ClientConfig::new(Arc::new(crypto));
-    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let endpoint = quinn::Endpoint::client(socket).unwrap();
+    let endpoint = new_endpoint(None).unwrap();
+
+    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+    client_config.version(QUIC_VERSION);
 
     let connection = endpoint
         .connect_with(client_config, server_addr, "localhost")
