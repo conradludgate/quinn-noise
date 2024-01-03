@@ -8,11 +8,10 @@ repository = "https://github.com/conradludgate/quinn-noise"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bytemuck = { version = "1.14.0", features = ["derive", "extern_crate_std"] }
 bytes = "1.5.0"
 noise-protocol = "0.2.0"
 quinn-proto = { version = "0.10.6", default-features = false }
-ring = "0.17.7"
+subtle = "2.5.0"
 
 [dev-dependencies]
 anyhow = "1"

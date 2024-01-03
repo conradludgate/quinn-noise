@@ -9,8 +9,8 @@ This is a fork of the `ipfs-rust/quinn-noise` project. It is a significant rewri
 My intended usecase is similar to that of wireguard or SSH. The client will know the server's public key,
 but the server will not know which client to initially expect. Because of this, I am using the `IK` pattern
 
-* `I` - Static key for initiator Immediately transmitted to responder, despite reduced or absent identity hiding
-* `K` - Static key for responder Known to initiator
+- `I` - Static key for initiator Immediately transmitted to responder, despite reduced or absent identity hiding
+- `K` - Static key for responder Known to initiator
 
 ```
 IK:
@@ -43,7 +43,12 @@ being questionable if it serves it's purpose it was decided that no header obfus
 
 ## Retry mechanism
 
-The retry mechanism is identical to what is specified in the quic-tls spec.
+The retry mechanism is similar to what is specified in the [quic-tls](https://www.rfc-editor.org/rfc/rfc9001.html#name-retry-packet-integrity) spec.
+
+The Retry Integrity Tag is a 128-bit field that is computed as the output of HMAC (using the provided hash function) used with the following inputs:
+
+- The secret key, K, is equal to `hkdf_expand(0xd9c9943e6101fd200021506bcc02814c73030f25c79d71ce876eca876e6fca8e, "QUIC integrity key" || handshake_pattern, hash_output_size)`.
+- The associated data, A, is the contents of the Retry Pseudo-Packet, as illustrated in Figure 8
 
 ## License
 

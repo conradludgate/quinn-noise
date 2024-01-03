@@ -3,15 +3,18 @@ mod session;
 use std::marker::PhantomData;
 
 use noise_protocol::{patterns::noise_ik, Cipher, HandshakeState, HandshakeStateBuilder, Hash, DH};
+use session::get_integrity_key;
 
 pub struct NoiseClientConfig<D: DH, C: Cipher, H: Hash> {
     state: HandshakeState<D, C, H>,
     requested_protocols: Vec<Vec<u8>>,
+    integrity_key: H::Output,
 }
 
 pub struct NoiseServerConfig<D: DH, C: Cipher, H: Hash> {
     state: HandshakeState<D, C, H>,
     supported_protocols: Vec<Vec<u8>>,
+    integrity_key: H::Output,
 }
 
 impl<D: DH, C: Cipher, H: Hash> NoiseServerConfig<D, C, H> {
@@ -47,8 +50,11 @@ impl<D: DH, C: Cipher, H: Hash> NoiseServerConfigBuilder<'_, D, C, H> {
     }
 
     pub fn build(self) -> NoiseServerConfig<D, C, H> {
+        let state = self.builder.build_handshake_state();
+        let integrity_key = get_integrity_key(&state);
         NoiseServerConfig {
-            state: self.builder.build_handshake_state(),
+            state,
+            integrity_key,
             supported_protocols: self.supported_protocols,
         }
     }
@@ -92,8 +98,11 @@ impl<D: DH, C: Cipher, H: Hash> NoiseClientConfigBuilder<'_, D, C, H> {
     }
 
     pub fn build(self) -> NoiseClientConfig<D, C, H> {
+        let state = self.builder.build_handshake_state();
+        let integrity_key = get_integrity_key(&state);
         NoiseClientConfig {
-            state: self.builder.build_handshake_state(),
+            state,
+            integrity_key,
             requested_protocols: self.requested_protocols,
         }
     }

@@ -4,10 +4,9 @@ use quinn_proto::crypto::{
 };
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectionId, Side, TransportError, TransportErrorCode};
-use ring::aead;
 use std::any::Any;
 use std::convert::TryInto;
-use std::marker::PhantomData;
+use subtle::ConstantTimeEq;
 
 use crate::HandshakeData;
 
@@ -58,39 +57,6 @@ where
     }
 }
 
-trait State<D: DH, C: Cipher>: 'static + Send + Sync {
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<C::Key>> {
-        None
-    }
-
-    fn read_handshake(
-        self: Box<Self>,
-        _data: &mut CommonData<D>,
-        _handshake: &[u8],
-    ) -> Result<Box<dyn State<D, C>>, TransportError> {
-        Err(TransportError {
-            code: TransportErrorCode::CONNECTION_REFUSED,
-            frame: None,
-            reason: "unexpected crypto frame".to_string(),
-        })
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn write_handshake(
-        self: Box<Self>,
-        data: &CommonData<D>,
-        handshake: &mut Vec<u8>,
-    ) -> (Box<dyn State<D, C>>, Option<KeyPair<C::Key>>);
-
-    fn is_handshaking(&self) -> bool {
-        true
-    }
-
-    fn get_channel_binding(&self) -> &[u8] {
-        &[]
-    }
-}
-
 fn client_server<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> (C::Key, C::Key) {
     let (client, server) = state.get_ciphers();
     let (client, 0) = client.extract() else {
@@ -106,6 +72,7 @@ struct InnerHandshakeState<D: DH, C: Cipher, H: Hash> {
     state: HandshakeState<D, C, H>,
     // a little bit annoying that neither snow nor noise-protocol expose this field directly
     pattern: usize,
+    needs_keys: bool,
 }
 
 impl<D: DH, C: Cipher, H: Hash> InnerHandshakeState<D, C, H> {
@@ -114,6 +81,20 @@ impl<D: DH, C: Cipher, H: Hash> InnerHandshakeState<D, C, H> {
     }
     fn connection_parameters_response(&self) -> bool {
         self.pattern + 2 >= self.state.get_pattern().get_message_patterns_len()
+    }
+    fn keys(&self) -> KeyPair<<C as Cipher>::Key> {
+        let (client, server) = client_server(&self.state);
+        if self.state.get_is_initiator() {
+            KeyPair {
+                local: client,
+                remote: server,
+            }
+        } else {
+            KeyPair {
+                local: server,
+                remote: client,
+            }
+        }
     }
 }
 
@@ -134,40 +115,19 @@ impl<C: Cipher, H: Hash> Data<C, H> {
     }
 }
 
-impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> State<D, C> for Data<C, H>
-where
-    C::Key: 'static + Send + Sync,
-    H::Output: 'static + Send + Sync,
-{
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<C::Key>> {
-        Some(self.next_keys())
-    }
-
-    fn write_handshake(
-        self: Box<Self>,
-        _data: &CommonData<D>,
-        _handshake: &mut Vec<u8>,
-    ) -> (Box<dyn State<D, C>>, Option<KeyPair<C::Key>>) {
-        (self, None)
-    }
-
-    fn is_handshaking(&self) -> bool {
-        false
-    }
-
-    fn get_channel_binding(&self) -> &[u8] {
-        self.hash.as_slice()
-    }
+enum State<D: DH, C: Cipher, H: Hash> {
+    Handshaking(Box<InnerHandshakeState<D, C, H>>),
+    Complete(Data<C, H>),
 }
 
 struct NoiseSession<D: DH, C: Cipher, H: Hash> {
-    state: Result<Box<dyn State<D, C>>, TransportError>,
+    state: State<D, C, H>,
     data: CommonData<D>,
-    hash: PhantomData<H::Output>,
+    integrity_key: H::Output,
 }
 
 struct CommonData<D: DH> {
-    requested_protocols: Vec<Vec<u8>>,
+    negotiated_protocol: Option<Vec<u8>>,
     supported_protocols: Vec<Vec<u8>>,
     transport_parameters: TransportParameters,
     remote_transport_parameters: Option<TransportParameters>,
@@ -210,6 +170,23 @@ fn noise_error(e: noise_protocol::Error) -> TransportError {
     }
 }
 
+pub fn get_integrity_key<D: DH, C: Cipher, H: Hash>(state: &HandshakeState<D, C, H>) -> H::Output {
+    // same seed as QUIC-TLS <https://www.rfc-editor.org/rfc/rfc9001.html#name-retry-packet-integrity>
+    // > The secret key and the nonce are values derived by calling HKDF-Expand-Label using
+    // > 0xd9c9943e6101fd200021506bcc02814c73030f25c79d71ce876eca876e6fca8e as the secret,
+    // > with labels being "quic key" and "quic iv" (Section 5.1).
+    //
+    // In this case, I am using ("QUIC integrity key" || noise handshake pattern) as the label
+    const SEED: [u8; 32] = [
+        0xd9, 0xc9, 0x94, 0x3e, 0x61, 0x01, 0xfd, 0x20, 0x00, 0x21, 0x50, 0x6b, 0xcc, 0x02, 0x81,
+        0x4c, 0x73, 0x03, 0x0f, 0x25, 0xc7, 0x9d, 0x71, 0xce, 0x87, 0x6e, 0xca, 0x87, 0x6e, 0x6f,
+        0xca, 0x8e,
+    ];
+    let label = state.get_pattern().get_name();
+    // hkdf_expand(SEED, label, output_size);
+    H::hmac_many(&SEED, &[b"QUIC integrity key", label.as_bytes(), &[1u8]])
+}
+
 impl<D: DH + 'static, C: Cipher + 'static, H: Hash + 'static> Session for NoiseSession<D, C, H>
 where
     D::Pubkey: 'static + Send + Sync,
@@ -222,41 +199,177 @@ where
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        self.state
-            .as_mut()
-            .unwrap()
-            .next_1rtt_keys()
-            .map(packet_keys::<C>)
+        match &mut self.state {
+            State::Handshaking(_) => None,
+            State::Complete(data) => Some(packet_keys::<C>(data.next_keys())),
+        }
     }
 
     fn read_handshake(&mut self, handshake: &[u8]) -> Result<bool, TransportError> {
-        self.state = Ok(std::mem::replace(
-            &mut self.state,
-            Err(connection_refused("broken poison state")),
-        )?
-        .read_handshake(&mut self.data, handshake)?);
+        let State::Handshaking(inner) = &mut self.state else {
+            return Err(TransportError {
+                code: TransportErrorCode::CONNECTION_REFUSED,
+                frame: None,
+                reason: "unexpected crypto frame".to_string(),
+            });
+        };
 
-        Ok(!self.data.requested_protocols.is_empty())
+        if inner.state.is_write_turn() {
+            return Err(TransportError {
+                code: TransportErrorCode::CONNECTION_REFUSED,
+                frame: None,
+                reason: "unexpected crypto frame".to_string(),
+            });
+        }
+
+        let payload = inner
+            .state
+            .read_message_vec(handshake)
+            .map_err(noise_error)?;
+        inner.pattern += 1;
+        inner.needs_keys = true;
+
+        self.data.remote_s = inner.state.get_rs();
+
+        if !inner.state.get_is_initiator() && inner.connection_parameters_request() {
+            // alpn
+            let (&[len], rest) = split_n(&payload)?;
+            let (mut alpns, mut transport_params) = split(rest, len as usize)?;
+
+            if !self.data.supported_protocols.is_empty() {
+                while !alpns.is_empty() {
+                    let (&[len], next) = split_n(alpns)?;
+                    let (alpn, next_alpn) = split(next, len as usize)?;
+                    alpns = next_alpn;
+                    let found = self
+                        .data
+                        .supported_protocols
+                        .iter()
+                        .any(|proto| proto.as_slice() == alpn);
+
+                    if found {
+                        self.data.negotiated_protocol = Some(alpn.to_vec());
+                        break;
+                    }
+                }
+                if self.data.negotiated_protocol.is_none() {
+                    return Err(connection_refused("unsupported alpn"));
+                }
+            }
+
+            self.data.remote_transport_parameters = Some(TransportParameters::read(
+                Side::Server,
+                &mut transport_params,
+            )?);
+        }
+
+        if inner.state.get_is_initiator() && inner.connection_parameters_response() {
+            // alpn
+            let (&[len], rest) = split_n(&payload)?;
+            let (alpn, mut transport_params) = split(rest, len as usize)?;
+            self.data.negotiated_protocol =
+                self.data.supported_protocols.drain(..).find(|p| p == alpn);
+            if !self.data.supported_protocols.is_empty() && self.data.negotiated_protocol.is_none()
+            {
+                return Err(connection_refused("unsupported alpn"));
+            }
+
+            self.data.remote_transport_parameters = Some(TransportParameters::read(
+                Side::Client,
+                &mut transport_params,
+            )?);
+        }
+
+        Ok(self.data.negotiated_protocol.is_some())
     }
 
     fn write_handshake(&mut self, handshake: &mut Vec<u8>) -> Option<Keys> {
-        let (state, keys) = std::mem::replace(
-            &mut self.state,
-            Err(connection_refused("broken poison state")),
-        )
-        .unwrap()
-        .write_handshake(&self.data, handshake);
+        let State::Handshaking(inner) = &mut self.state else {
+            return None;
+        };
 
-        self.state = Ok(state);
+        let mut keys = inner.keys();
+        if inner.state.completed() {
+            let mut data = Data {
+                keys,
+                hash: H::Output::from_slice(inner.state.get_hash()),
+            };
+            keys = data.next_keys();
+            self.state = State::Complete(data);
 
-        keys.map(|keys| Keys {
+            return Some(Keys {
+                header: header_keypair(),
+                packet: packet_keys::<C>(keys),
+            });
+        }
+
+        if inner.needs_keys {
+            inner.needs_keys = false;
+
+            return Some(Keys {
+                header: header_keypair(),
+                packet: packet_keys::<C>(keys),
+            });
+        }
+
+        if !inner.state.is_write_turn() {
+            return None;
+        }
+
+        // payload
+        let mut payload = vec![];
+
+        if inner.state.get_is_initiator() && inner.connection_parameters_request() {
+            // alpn
+            let len = self
+                .data
+                .supported_protocols
+                .iter()
+                .map(|s| s.len() as u8 + 1)
+                .sum::<u8>();
+            payload.extend_from_slice(&len.to_le_bytes());
+            for alpn in &self.data.supported_protocols {
+                payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
+                payload.extend_from_slice(alpn);
+            }
+
+            self.data.transport_parameters.write(&mut payload);
+        }
+
+        if !inner.state.get_is_initiator() && inner.connection_parameters_response() {
+            // alpn
+            if let Some(alpn) = &self.data.negotiated_protocol {
+                payload.extend_from_slice(&(alpn.len() as u8).to_le_bytes());
+                payload.extend_from_slice(alpn);
+            }
+
+            self.data.transport_parameters.write(&mut payload);
+        }
+
+        let overhead = inner.state.get_next_message_overhead();
+        handshake.resize(overhead + payload.len(), 0);
+
+        inner.state.write_message(&payload, handshake).unwrap();
+        inner.pattern += 1;
+
+        let mut keys = inner.keys();
+        if inner.state.completed() {
+            let mut data = Data {
+                keys,
+                hash: H::Output::from_slice(inner.state.get_hash()),
+            };
+            keys = data.next_keys();
+            self.state = State::Complete(data);
+        }
+
+        Some(Keys {
             header: header_keypair(),
             packet: packet_keys::<C>(keys),
         })
     }
 
     fn is_handshaking(&self) -> bool {
-        self.state.as_ref().unwrap().is_handshaking()
+        matches!(&self.state, State::Handshaking(_))
     }
 
     fn peer_identity(&self) -> Option<Box<dyn Any>> {
@@ -273,7 +386,7 @@ where
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
         Some(Box::new(HandshakeData {
-            alpn: self.data.requested_protocols.get(0)?.clone(),
+            alpn: self.data.negotiated_protocol.clone()?,
         }))
     }
 
@@ -290,7 +403,10 @@ where
             return Err(ExportKeyingMaterialError);
         }
 
-        let hash = self.state.as_ref().unwrap().get_channel_binding();
+        let hash = match &self.state {
+            State::Handshaking(_) => return Err(ExportKeyingMaterialError),
+            State::Complete(data) => data.hash.as_slice(),
+        };
 
         let mut chunks = output.chunks_mut(H::hash_len()).enumerate();
         let (i, chunk) = chunks.next().unwrap();
@@ -318,28 +434,13 @@ where
             Some(x) => x,
             None => return false,
         };
+        let (packet, tag) = payload.split_at(tag_start);
 
-        let mut pseudo_packet =
-            Vec::with_capacity(header.len() + payload.len() + orig_dst_cid.len() + 1);
-        pseudo_packet.push(orig_dst_cid.len() as u8);
-        pseudo_packet.extend_from_slice(orig_dst_cid);
-        pseudo_packet.extend_from_slice(header);
-        let tag_start = tag_start + pseudo_packet.len();
-        pseudo_packet.extend_from_slice(payload);
-
-        let nonce = aead::Nonce::assume_unique_for_key(RETRY_INTEGRITY_NONCE);
-        let key = aead::LessSafeKey::new(
-            aead::UnboundKey::new(&aead::AES_128_GCM, &RETRY_INTEGRITY_KEY).unwrap(),
+        let check = H::hmac_many(
+            self.integrity_key.as_slice(),
+            &[&[orig_dst_cid.len() as u8], orig_dst_cid, header, packet],
         );
 
-        let (aad, tag) = pseudo_packet.split_at_mut(tag_start);
-        key.open_in_place(nonce, aead::Aad::from(aad), tag).is_ok()
+        tag.ct_eq(&check.as_slice()[..16]).into()
     }
 }
-
-const RETRY_INTEGRITY_KEY: [u8; 16] = [
-    0xcc, 0xce, 0x18, 0x7e, 0xd0, 0x9a, 0x09, 0xd0, 0x57, 0x28, 0x15, 0x5a, 0x6c, 0xb9, 0x6b, 0xe1,
-];
-const RETRY_INTEGRITY_NONCE: [u8; 12] = [
-    0xe5, 0x49, 0x30, 0xf9, 0x7f, 0x21, 0x36, 0xf0, 0x53, 0x0a, 0x8c, 0x1c,
-];
